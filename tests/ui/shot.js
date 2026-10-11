@@ -63,6 +63,36 @@ const text = (page) => page.evaluate(() => document.body.innerText);
   ok(errors.length === 0, 'нет ошибок в консоли ' + errors.join('; '));
   await page.context().close();
 
+  console.log('== пинг: анимация, кнопки, отсутствие кружка');
+  ({ page, errors } = await open(browser, 'connected'));
+  ok(await page.locator('.hv-ck').count() === 0, 'кружок с галочкой удалён');
+  const op = await page.locator('.hv-row').nth(2).locator('.hv-x').first()
+    .evaluate(e => getComputedStyle(e).opacity);
+  ok(parseFloat(op) === 1, 'кнопки пинга и удаления видны без наведения');
+  const widths = await page.locator('.hv-row .hv-ms').evaluateAll(
+    els => els.map(e => Math.round(e.getBoundingClientRect().width)));
+  ok(widths.length > 0 && new Set(widths).size === 1, 'колонка пинга одной ширины — цифры не прыгают');
+  await page.context().close();
+
+  // с задержкой на ответе видно анимацию замера
+  ({ page, errors } = await open(browser, 'connected', { lag: 2500 }));
+  await page.waitForTimeout(400);
+  const spin = await page.locator('.hv-ms.wait').count();
+  ok(spin === 8, `крутилка замера у всех живых серверов (${spin}/8)`);
+  await page.screenshot({ path: out + '/pinging.png' });
+  await page.waitForTimeout(3200);
+  ok(await page.locator('.hv-ms.wait').count() === 0, 'после замера крутилки исчезли');
+  ok(await page.locator('.hv-ms.g, .hv-ms.y, .hv-ms.r').count() === 8, 'пинги показаны у всех серверов');
+  await page.click('.hv-pingall');
+  await page.waitForTimeout(400);
+  ok(await page.locator('.hv-ms.wait').count() === 8, 'ручной «Пинг всех» тоже показывает крутилки');
+  await page.waitForTimeout(2600);
+  ok(/Пинг обновлён: 8 серверов/.test(await text(page)),
+     'тост сообщает, сколько серверов замерено, а не просто «обновлён»');
+  await page.screenshot({ path: out + '/pinged.png' });
+  ok(errors.length === 0, 'нет ошибок в консоли ' + errors.join('; '));
+  await page.context().close();
+
   console.log('== отключено / тёмная тема / подключение по кнопке');
   ({ page, errors } = await open(browser, 'off', { dark: true }));
   await page.screenshot({ path: out + '/off_dark.png' });

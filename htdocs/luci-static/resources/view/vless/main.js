@@ -133,23 +133,26 @@ var CSS = [
 '.hv-bar span{display:block;height:100%;background:var(--ac);border-radius:4px;transition:width .4s}',
 '.hv-bar.warn span{background:var(--warn)}.hv-bar.crit span{background:var(--bad)}',
 '.hv-bar.inf span{width:100%;background:var(--line)}',
-'.hv-row{display:flex;align-items:center;gap:10px;padding:7px 9px;border-radius:var(--r);cursor:pointer;border:1px solid transparent;transition:background .1s,border-color .1s;margin-bottom:1px;min-width:0;position:relative}',
+'.hv-row{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:var(--r);cursor:pointer;border:1px solid transparent;transition:background .1s,border-color .1s;min-width:0;position:relative}',
+'.hv-row:after{content:"";position:absolute;left:8px;right:8px;bottom:0;height:1px;background:var(--line);opacity:.8;pointer-events:none}',
 '.hv-row:hover{background:var(--card2)}',
 '.hv-row.sel{background:var(--acs);border-color:rgba(45,108,181,.3)}',
+'.hv-row.sel:after,.hv-row.off:after{opacity:0}',
 '.hv-row.off{opacity:.5;cursor:not-allowed}',
 '.hv-fl{width:30px;height:22px;border-radius:3px;flex:none;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;letter-spacing:.03em;background:var(--card2);color:var(--tx2);border:1px solid var(--line)}',
 '.hv-fl.auto{background:var(--acs);color:var(--ac);border-color:transparent;font-size:14px}',
 '.hv-nm{flex:1;min-width:0;overflow:hidden}',
 '.hv-nm b{display:block;font-size:13.5px;font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 '.hv-nm span{display:block;font-size:11px;color:var(--tx2);letter-spacing:.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}',
-'.hv-ms{font-size:11.5px;font-weight:600;padding:1px 7px;border-radius:3px;background:var(--card2);color:var(--tx2);flex:none;font-variant-numeric:tabular-nums}',
+/* Значение пинга занимает фиксированную ширину всегда — иначе цифры «приезжают»
+   не с начала строки, а с середины, когда у части серверов замер ещё не готов. */
+'.hv-ms{font-size:11.5px;font-weight:600;padding:1px 7px;border-radius:3px;background:var(--card2);color:var(--tx2);flex:none;font-variant-numeric:tabular-nums;min-width:58px;height:19px;display:flex;align-items:center;justify-content:center}',
 '.hv-ms.g{color:var(--ok);background:var(--oks)}.hv-ms.y{color:var(--warn);background:var(--warns)}.hv-ms.r{color:var(--bad);background:var(--bads)}',
-'.hv-ck{width:18px;height:18px;border-radius:50%;border:1.5px solid transparent;flex:none;display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;transition:.1s}',
-'.hv-row.sel .hv-ck{background:var(--ac);border-color:var(--ac)}',
-'.hv-row:hover .hv-ck{border-color:var(--line)}',
-'.hv-x{opacity:0;transition:.1s;flex:none}',
-'.hv-row:hover .hv-x,.hv-row:focus-within .hv-x{opacity:1}',
-'@media(hover:none){.hv-x{opacity:1}}',
+'.hv-ms.none{background:none}',
+'.hv-ms.wait{background:none;position:relative;color:transparent}',
+'.hv-ms.wait:after{content:"";position:absolute;left:50%;top:50%;width:11px;height:11px;margin:-5.5px 0 0 -5.5px;border:1.5px solid var(--line);border-top-color:var(--ac);border-radius:50%;animation:hvspin .7s linear infinite}',
+/* Кнопки пинга и удаления видны всегда: наводить мышь ради второго действия не нужно */
+'.hv-x{flex:none}',
 '.hv-empty{text-align:center;padding:26px 10px;color:var(--tx2);font-size:13px}',
 '.hv-hero{text-align:center;padding:22px 10px 10px}',
 '.hv-hero>i{width:40px;height:40px;border-radius:var(--r);background:var(--card2);color:var(--tx2);font-size:20px;margin:0 auto 10px;border:1px solid var(--line)}',
@@ -488,6 +491,8 @@ return view.extend({
 		this.check = null;
 		this.search = '';
 		this.pinged = false;
+		this.pinging = false;   /* идёт «Пинг всех» — показываем крутилки у серверов */
+		this.pingOne = null;    /* id одиночного замера */
 		this.rate = { down: 0, up: 0 };
 		this._prev = null;
 		this._upSince = 0;
@@ -734,7 +739,8 @@ return view.extend({
 				list.appendChild(self.rowEl({
 					id: s.id, flagCode: g.f.code, name: g.f.name,
 					sub: s.supported ? self.metaOf(s) : (s.reason || 'не поддерживается'),
-					ms: (S.delays || {})[s.id], sel: selected === s.id, ok: s.supported, removable: true
+					ms: (S.delays || {})[s.id], sel: selected === s.id, ok: s.supported, removable: true,
+					wait: s.supported && (self.pinging || self.pingOne === s.id)
 				}));
 			});
 		});
@@ -778,7 +784,18 @@ return view.extend({
 			o.auto ? flagEl('', true) : flagEl(o.flagCode),
 			E('div', { 'class': 'hv-nm' }, [E('b', { title: o.name }, o.name), E('span', {}, o.sub)])
 		]);
-		if (typeof o.ms === 'number') row.appendChild(E('div', { 'class': 'hv-ms ' + msClass(o.ms) }, o.ms + ' мс'));
+		/* Пинг: крутилка, значение или пустое место той же ширины.
+		   Проверяем «измеряем» первым, чтобы при повторном замере показывалась
+		   анимация, а не устаревшее число. Кружок с галочкой убран — выбранный
+		   сервер и так выделяется синим. */
+		if (!o.auto) {
+			if (o.wait)
+				row.appendChild(E('div', { 'class': 'hv-ms wait', role: 'progressbar', 'aria-label': 'Измеряем задержку' }));
+			else if (typeof o.ms === 'number')
+				row.appendChild(E('div', { 'class': 'hv-ms ' + msClass(o.ms), title: 'Задержка до сервера' }, o.ms + ' мс'));
+			else
+				row.appendChild(E('div', { 'class': 'hv-ms none' }));
+		}
 		if (o.ok && !o.auto)
 			row.appendChild(E('button', {
 				type: 'button', 'class': 'hv-ibtn sm flat hv-x', title: 'Пинг этого сервера', 'aria-label': 'Пинг этого сервера',
@@ -789,7 +806,6 @@ return view.extend({
 				type: 'button', 'class': 'hv-ibtn sm flat dng hv-x', title: 'Удалить сервер', 'aria-label': 'Удалить сервер',
 				click: function (ev) { ev.stopPropagation(); self.doRemove(o.id, o.name, 'сервер'); }
 			}, [ic('trash')]));
-		row.appendChild(E('div', { 'class': 'hv-ck' }, o.sel ? [ic('check')] : []));
 		return row;
 	},
 
@@ -1051,9 +1067,12 @@ return view.extend({
 		if (this._pinging) return;
 		this._pinging = true;
 		this.pinged = true;
+		this.pinging = true;
+		this.drawList();                    /* крутилки появляются сразу, а не после ответа */
 		if (btn) { btn.disabled = true; btn.classList.add('spin'); btn.lastChild.textContent = 'Измеряю…'; }
 		var done = function () {
 			self._pinging = false;
+			self.pinging = false;
 			if (btn) { btn.disabled = false; btn.classList.remove('spin'); btn.lastChild.textContent = 'Пинг всех'; }
 		};
 		/* Если VPN не подключён — прямой пинг, иначе через VPN (точнее) */
@@ -1062,19 +1081,26 @@ return view.extend({
 			done();
 			if (r && r.delays) self.S.delays = r.delays;
 			if (manual) {
+				var n = r && r.delays ? Object.keys(r.delays).length : 0;
 				if (!r || !r.ok) self.toast((r && r.error) || 'Не удалось измерить пинг', true);
-				else self.toast(r.direct ? 'Пинг обновлён (прямой)' : 'Пинг обновлён');
+				else if (!n) self.toast('Ни один сервер не ответил', true);
+				else self.toast('Пинг обновлён: ' + n + ' ' + plural(n, 'сервер', 'сервера', 'серверов') + (r.direct ? ' (прямой)' : ''));
 			}
 			self.drawList();
 			self.updatePower();
-		}).catch(function () { done(); if (manual) self.toast('Роутер не ответил вовремя', true); });
+		}).catch(function () { done(); self.drawList(); if (manual) self.toast('Роутер не ответил вовремя', true); });
 	},
 
 	doPingOne: function (id, btn) {
 		var self = this;
 		if (!id) { this.toast('Сначала выберите сервер или подключитесь', true); return; }
+		this.pingOne = id;
+		this.drawList();
 		if (btn) { btn.classList.add('spin'); btn.disabled = true; }
-		var done = function () { if (btn) { btn.classList.remove('spin'); btn.disabled = false; } };
+		var done = function () {
+			self.pingOne = null;
+			if (btn) { btn.classList.remove('spin'); btn.disabled = false; }
+		};
 		var pingFn = (this.phase() === 'on') ? function () { return rPingOne(id); } : function () { return rPingOneDirect(id); };
 		withRetry(pingFn).then(function (r) {
 			done();
@@ -1083,7 +1109,7 @@ return view.extend({
 			else self.toast('Пинг: ' + r.ms + ' мс' + (r.direct ? ' (прямой)' : ''));
 			self.drawList();
 			self.updatePower();
-		}).catch(function () { done(); self.toast('Не удалось измерить пинг', true); });
+		}).catch(function () { done(); self.drawList(); self.toast('Не удалось измерить пинг', true); });
 	},
 
 	/* ───── опрос ───── */

@@ -100,6 +100,40 @@ printf '%s' "$XJ" > "$W/sub.json"
 printf '%s\n' "$(body_to_tsv "$W/sub.json" 2>/dev/null)" | cut -f2 | jq -e '.outbound.type=="vless"' >/dev/null 2>&1 \
 	&& ok "обычный Xray-JSON по-прежнему распознаётся" || bad "обычный Xray-JSON"
 
+echo "== замер пинга при подключённом VPN"
+# В Clash API sing-box 1.12+ нет маршрута /group/... — прежний код стучался туда
+# и всегда получал ошибку, поэтому пинг не появлялся. Меряем /proxies/s-<id>/delay сами.
+grep -qE "api GET '?/group/" root/usr/bin/vless && bad "в коде остался несуществующий запрос /group/" \
+	|| ok "запросов к несуществующему /group/ больше нет"
+SERVERS="$VLESS_DIR/servers.json"; RUN="$VLESS_RUN"
+eval "$(sed -n '/^api()/,/^}/p;/^ping_all_servers()/,/^}/p' root/usr/bin/vless)"
+[ -f "$SERVERS" ] && cp "$SERVERS" "$SERVERS.ping.bak"
+printf '%s\n' aaaaaaa1 aaaaaaa2 dead0001 aaaaaaa3 aaaaaaa4 |
+	jq -R -s 'split("\n") | map(select(length > 0))
+		| map({ id:., source:"t", supported:true, outbound:{type:"vless"}, name:.,
+		        proto:"vless", server:"h", port:443, net:"ws", sec:"tls" })' > "$SERVERS"
+out="$( (export PATH="$ROOT/tests/mock/api:$PATH"; ping_all_servers) )"
+printf '%s' "$out" | jq -e 'type=="object" and length==4' >/dev/null 2>&1 \
+	&& ok "замерены 4 живых сервера, мёртвый отброшен" || bad "состав замера: $out"
+printf '%s' "$out" | jq -e '[.[]|type]|all(.=="number")' >/dev/null 2>&1 \
+	&& ok "задержки числовые — интерфейс их покажет" || bad "тип задержек: $out"
+printf '%s' "$out" | jq -e 'has("aaaaaaa1")' >/dev/null 2>&1 \
+	&& ok "ключи задержек — id серверов (совпадают с интерфейсом)" || bad "ключи: $out"
+echo '[]' > "$SERVERS"
+out="$( (export PATH="$ROOT/tests/mock/api:$PATH"; ping_all_servers) )"
+[ "$out" = "{}" ] && ok "пустой список серверов -> {}" || bad "пустой список вернул: $out"
+[ -f "$SERVERS.ping.bak" ] && mv "$SERVERS.ping.bak" "$SERVERS"
+
+echo "== шум в журнале не должен показываться как ошибка"
+# После штатного отключения sing-box пишет обрыв загрузки на уровне ERROR.
+# Раньше эта строка всплывала как «Ошибка подключения».
+printf '%s\n' "+0000 ERROR [1 55.63s] connection: connection download closed: http2: client connection force closed via ClientConn.Close" \
+	> "$RUN/sing-box.log"
+printf '%s\n' "+0000 INFO inbound/tun[tun-in]: started at vless0" >> "$RUN/sing-box.log"
+eval "$(sed -n '/^log_noise()/,/^}/p' root/usr/bin/vless)"
+err="$(grep -iE 'fatal|error' "$RUN/sing-box.log" | log_noise)"
+[ -z "$err" ] && ok "обрыв соединения отфильтрован" || bad "шум не отфильтрован: $err"
+
 echo "== прочее"
 r="$($H status)"
 t "status: выключено, без ошибки" "$r" '.running==false and .phase=="off" and .error==""'
@@ -110,6 +144,21 @@ t "disconnect: ok" "$r" '.ok==true'
 r="$($H clear)"
 t "clear: всё очищено" "$r" '.ok==true'
 t "clear: пусто" "$($H state)" '(.servers|length)==0 and (.sources|length)==0'
+
+echo "== отключение не тащит старые ошибки в статус"
+# Раньше после штатного отключения sing-box писал обрыв соединения на уровне ERROR,
+# и эта строка всплывала в интерфейсе как «Ошибка подключения».
+printf '%s\n' "+0000 ERROR [1 55.63s] connection: connection download closed: http2: client connection force closed via ClientConn.Close" \
+	"+0000 INFO inbound/tun[tun-in]: started at vless0" > "$VLESS_RUN/sing-box.log"
+$H disconnect >/dev/null
+[ -s "$VLESS_RUN/sing-box.prev.log" ] && ok "журнал прошлого запуска сохранён" || bad "журнал прошлого запуска потерян"
+[ -s "$VLESS_RUN/sing-box.log" ] && bad "после отключения журнал не чистый" || ok "после отключения журнал чистый"
+r="$($H status)"
+printf '%s' "$r" | jq -e '.error=="" and .phase=="off"' >/dev/null 2>&1 \
+	&& ok "статус после отключения без ошибки" || bad "после отключения ошибка: $r"
+r="$($H logs)"
+printf '%s' "$r" | jq -e '.log | test("предыдущий запуск")' >/dev/null 2>&1 \
+	&& ok "журнал показывает прошлый запуск отдельным блоком" || bad "прошлый запуск не виден в журнале"
 
 echo "== rpcd-плагин"
 RP="sh $ROOT/root/usr/libexec/rpcd/vless"

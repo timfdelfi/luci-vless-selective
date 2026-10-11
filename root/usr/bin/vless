@@ -581,8 +581,17 @@ cmd_prepare() {
 cmd_connect() {
 	local i=0
 	: > "$RUN/last_error"
-	/etc/init.d/vless restart >/dev/null 2>&1
-	while [ $i -lt 8 ]; do
+	# Старый экземпляр должен освободить vless0 до старта нового. procd не ждёт
+	# полного завершения, поэтому новый sing-box не мог создать туннель, подключение
+	# падало с ошибкой, и приходилось нажимать кнопку второй раз.
+	/etc/init.d/vless stop >/dev/null 2>&1
+	i=0
+	while [ $i -lt 10 ] && is_running; do sleep 1; i=$((i + 1)); done
+	i=0
+	while [ $i -lt 5 ] && ip link show "$TUN" >/dev/null 2>&1; do sleep 1; i=$((i + 1)); done
+	/etc/init.d/vless start >/dev/null 2>&1
+	i=0
+	while [ $i -lt 20 ]; do
 		is_running && break
 		[ -s "$RUN/last_error" ] && break
 		sleep 1; i=$((i + 1))
@@ -596,6 +605,13 @@ cmd_connect() {
 
 cmd_disconnect() {
 	/etc/init.d/vless stop >/dev/null 2>&1
+	# Журнал прошлой сессии убираем в сторону и начинаем чистый. Иначе ошибки,
+	# случившиеся во время работы, всплывают потом как «Ошибка подключения»
+	# уже после того, как пользователь отключился штатно.
+	if [ -s "$RUN/sing-box.log" ]; then
+		tail -n 400 "$RUN/sing-box.log" > "$RUN/sing-box.prev.log" 2>/dev/null
+	fi
+	: > "$RUN/sing-box.log"
 	rm -f "$RUN/up_since" "$RUN/ip.json"
 	: > "$RUN/last_error"
 	jq -n -c '{ok:true}'
@@ -843,6 +859,13 @@ net_down() {
 
 # ---------------------------------------------------------------- диагностика
 
+# Шум при штатном отключении. sing-box пишет обрыв загрузки на уровне ERROR,
+# хотя соединение закрыл сам пользователь кнопкой «Отключить». Такие строки
+# не должны показываться как «Ошибка подключения».
+log_noise() {
+	grep -viE 'connection download closed|ClientConn\.Close|force closed|context canceled|use of closed network connection|operation was canceled'
+}
+
 ip_lookup() { # через локальный proxy sing-box
 	local u r why=""
 	for u in "https://ipwho.is/" "https://api.ip.sb/geoip" "https://api.myip.com"; do
@@ -870,13 +893,47 @@ cmd_check() {
 	jq -n -c --argjson d "$d" --argjson ip "${ipj:-null}" '{ok:true,delay:$d,ip:$ip}'
 }
 
+PING_URL="https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
+
+# Задержки всех серверов: по одному запросу /proxies/s-<id>/delay на сервер, параллельно.
+# Раньше использовался /group/auto/delay — такого эндпоинта в Clash API sing-box 1.12+
+# просто нет (маршруты /configs, /proxies, /rules, /connections, /dns, /profile, /cache,
+# /providers, /script, /ui), поэтому «Пинг всех» при подключённом VPN всегда заканчивался
+# ошибкой и цифры не появлялись. Меряем сами, ограничивая число одновременных запросов,
+# чтобы роутер не захлебнулся.
+ping_all_servers() { # -> {"id":мс,…}
+	local ids id d p n=0 pids="" dir="$RUN/delay.$$" f
+	rm -rf "$dir"; mkdir -p "$dir"
+	ids="$(jq -r '.[] | select(.supported==true and .outbound!=null) | .id' "$SERVERS" 2>/dev/null)"
+	if [ -z "$ids" ]; then echo '{}'; return 0; fi
+	for id in $ids; do
+		(
+			d="$(T=8 api GET "/proxies/s-$id/delay?url=$PING_URL&timeout=5000" 2>/dev/null |
+				jq -r 'if (.delay|type)=="number" then .delay else empty end' 2>/dev/null)"
+			[ -n "$d" ] && printf '%s' "$d" > "$dir/$id"
+		) &
+		pids="$pids $!"; n=$((n + 1))
+		if [ "$n" -ge 8 ]; then
+			for p in $pids; do wait "$p" 2>/dev/null; done
+			pids=""; n=0
+		fi
+	done
+	for p in $pids; do wait "$p" 2>/dev/null; done
+	for f in "$dir"/*; do
+		[ -f "$f" ] || continue
+		printf '%s\t%s\n' "${f##*/}" "$(cat "$f" 2>/dev/null)"
+	done | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t"))
+		| map({ key: .[0], value: (.[1] | tonumber?) }) | map(select(.value != null)) | from_entries' 2>/dev/null
+	rm -rf "$dir"
+}
+
 cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID — только один (через VPN, точнее)
 	local r id="$1" d
 	is_ready || { jq -n -c '{ok:false,error:"VPN не подключён — используйте кнопку «Пинг всех» для прямого измерения"}'; return 0; }
 	[ -s "$RUN/delays.json" ] || echo '{}' > "$RUN/delays.json"
 	if [ -n "$id" ]; then
 		echo "$id" | grep -qE '^[0-9a-f]{8}$' || { json_err "Некорректный id"; return 0; }
-		r="$(T=12 api GET "/proxies/s-$id/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=8000")"
+		r="$(T=12 api GET "/proxies/s-$id/delay?url=$PING_URL&timeout=8000")"
 		d="$(printf '%s\n' "$r" | jq -r 'if (.delay|type)=="number" then .delay else empty end' 2>/dev/null)"
 		if [ -n "$d" ]; then
 			jq -c --arg id "$id" --argjson d "$d" '. + {($id):$d}' "$RUN/delays.json" > "$RUN/delays.tmp" && mv "$RUN/delays.tmp" "$RUN/delays.json"
@@ -887,10 +944,14 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 		fi
 		return 0
 	fi
-	r="$(T=15 api GET '/group/auto/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000')"
-	printf '%s\n' "$r" | jq -e 'type=="object"' >/dev/null 2>&1 || { jq -n -c '{ok:false,error:"Не удалось измерить пинг"}'; return 0; }
-	printf '%s\n' "$r" | jq -c 'with_entries(select(.value|type=="number") | .key |= ltrimstr("s-"))' > "$RUN/delays.json"
-	jq -n -c --slurpfile d "$RUN/delays.json" '{ok:true,delays:$d[0]}'
+	r="$(ping_all_servers)"
+	printf '%s' "$r" | jq -e 'type=="object"' >/dev/null 2>&1 || r='{}'
+	printf '%s' "$r" > "$RUN/delays.json"
+	# Если не ответил ни один сервер — это честная неудача, а не «обновилось»
+	jq -n -c --slurpfile d "$RUN/delays.json" \
+		'($d[0] | length) as $n
+		 | if $n == 0 then {ok:false,error:"Ни один сервер не ответил",delays:{}}
+		   else {ok:true,delays:$d[0],count:$n} end'
 }
 
 # ping_direct [ID] — прямой пинг до сервера без VPN (curl, TCP connect + TLS handshake)
@@ -967,7 +1028,7 @@ cmd_status() {
 	fi
 	if [ "$ready" = false ]; then
 		err="$(cat "$RUN/last_error" 2>/dev/null)"
-		[ -n "$err" ] || err="$(grep -iE 'fatal|error' "$RUN/sing-box.log" 2>/dev/null | tail -n1 | cut -c1-300)"
+		[ -n "$err" ] || err="$(grep -iE 'fatal|error' "$RUN/sing-box.log" 2>/dev/null | log_noise | tail -n1 | cut -c1-300)"
 	fi
 	local other=false mine="" p ipj=null
 	[ -s "$RUN/ip.json" ] && ipj="$(cat "$RUN/ip.json")"
@@ -1003,13 +1064,16 @@ cmd_devices() {
 
 cmd_logs() {
 	{
-		echo "== sing-box =="; tail -n 60 "$RUN/sing-box.log" 2>/dev/null
+		echo "== sing-box =="
+		[ -s "$RUN/sing-box.prev.log" ] && { echo "— предыдущий запуск —"; tail -n 60 "$RUN/sing-box.prev.log" 2>/dev/null; echo; }
+		tail -n 60 "$RUN/sing-box.log" 2>/dev/null
 		echo; echo "== system =="; logread -e vless 2>/dev/null | tail -n 30
 	} | jq -R -s -c '{log:.}'
 }
 
 cmd_clearlog() {
 	: > "$RUN/sing-box.log"
+	: > "$RUN/sing-box.prev.log"
 	jq -n -c '{ok:true}'
 }
 

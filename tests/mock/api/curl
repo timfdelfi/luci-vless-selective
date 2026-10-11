@@ -1,0 +1,24 @@
+#!/bin/sh
+# Заглушка curl, которая отвечает как Clash API sing-box.
+# Нужна только для тестов замера пинга (подкладывается в PATH точечно).
+# Важно: в sing-box 1.12+ маршрута /group/... НЕТ вообще — на такой запрос
+# приходит ошибка, и именно из-за этого «Пинг всех» не работал.
+url=""
+for a in "$@"; do
+	case "$a" in http://*|https://*) url="$a" ;; esac
+done
+case "$url" in
+	*/group/*)
+		echo '{"message":"proxy group not found"}' ;;
+	*/delay*)
+		tag="${url%%/delay*}"
+		tag="${tag##*/}"
+		case "$tag" in
+			*dead*) echo '{"message":"An error occurred in the delay test"}' ;;
+			*)      echo '{"delay":123}' ;;
+		esac ;;
+	*/connections) echo '{"uploadTotal":0,"downloadTotal":0,"connections":[]}' ;;
+	*/proxies*)    echo '{"now":"auto","all":["auto"],"history":[]}' ;;
+	*)             echo '{}' ;;
+esac
+exit 0
