@@ -28,6 +28,10 @@ def is_ip:
   | ((($a | split(".")) as $p | ($p | length) == 4 and ($p | all(isdigits)))
      or (($a | contains(":")) and ($a | explode | all((. >= 48 and . <= 58) or (. >= 65 and . <= 70) or (. >= 97 and . <= 102)))));
 def is_domainlike: is_ip | not;
+# Пользователь пишет «*.example.org». nft-часть уже снимала «*.», а здесь оставалось
+# голое «*.example.org», из-за чего sing-box check падал и кнопка «Подключить»
+# не работала вовсе. Приводим оба пути к одному виду: снять «*.», отбросить прочие «*».
+def plain: ltrimstr("*.") | select(contains("*") | not);
 
 ($servers[0] // []) as $all
 | ($all | map(select(.supported == true and .outbound != null))) as $list
@@ -37,7 +41,7 @@ def is_domainlike: is_ip | not;
 | ($list | map(.server) | unique | map(select(is_domainlike))) as $vpn_hosts
 
 # исключения пользователя (всегда напрямую)
-| ($s.direct_domains // [] | map(select(type == "string" and length > 0))) as $dd
+| ($s.direct_domains // [] | map(select(type == "string" and length > 0)) | map(plain)) as $dd
 | ($dd | map(select(is_domainlike))) as $dd_domains
 | ($dd | map(select(is_ip))) as $dd_ips
 
@@ -45,7 +49,7 @@ def is_domainlike: is_ip | not;
 | (($s.scope // "all") == "selected") as $sel
 | presets as $PS
 | ($s.presets // [] | map(select(type == "string"))) as $keys
-| ($s.proxy_domains // [] | map(select(type == "string" and length > 0))) as $pd
+| ($s.proxy_domains // [] | map(select(type == "string" and length > 0)) | map(plain)) as $pd
 | ([ $keys[] as $k | ($PS[$k].domains // [])[] ] + ($pd | map(select(is_domainlike))) | unique) as $sel_domains
 | ([ $keys[] as $k | ($PS[$k].cidrs // [])[] ] + ($pd | map(select(is_ip))) | unique) as $sel_cidrs
 | ($s.block_quic != false) as $quic

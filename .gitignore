@@ -5,6 +5,9 @@ dist/
 # Вывод UI-тестов
 tests/ui/out/
 
+# Ставится только для запуска UI-тестов (npm install --no-save playwright)
+node_modules/
+
 # Служебное
 *.tmp
 *.swp

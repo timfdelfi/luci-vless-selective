@@ -2,6 +2,9 @@
 'require view';
 'require rpc';
 'require ui';
+/* E() берётся из dom; view.js его подтягивает, но полагаться на это — транзитивная
+   зависимость от внутреннего устройства LuCI. Объявляем явно. */
+'require dom';
 
 /* ───────────────────────── RPC ───────────────────────── */
 
@@ -860,40 +863,66 @@ return view.extend({
 				: servers.length ? 'Нажмите, чтобы подключиться' : 'Сначала добавьте ссылку слева';
 		}
 
-		/* текущий сервер */
-		this.curEl.innerHTML = '';
+		/* текущий сервер: пересобираем только при смене подписи. Перерисовка каждые
+		   3 секунды сбрасывала фокус с клавиатуры на <body> посреди работы со страницей. */
 		var sel = (S.settings && S.settings.selected) || 'auto';
 		var activeId = ph === 'on' && st.active ? st.active : (sel !== 'auto' ? sel : '');
 		var cur = activeId ? this.serverById(activeId) : null;
+		var sig = '';
 		if (servers.length && (cur || sel === 'auto')) {
 			var f = cur ? flagInfo(cur.name) : null;
 			var subt = cur ? ((sel === 'auto' && ph === 'on' ? 'Авто · ' : '') + this.metaOf(cur)) : 'Лучший сервер выбирается автоматически';
-			this.curEl.appendChild(E('div', { 'class': 'hv-cur' }, [
-				cur ? flagEl(f.code) : flagEl('', true),
-				E('div', { 'class': 'hv-nm' }, [E('b', {}, cur ? f.name : 'Авто'), E('span', {}, subt)])
-			]));
+			sig = (cur ? f.name : 'Авто') + '|' + subt;
+		}
+		if (this._curSig !== sig) {
+			this._curSig = sig;
+			this.curEl.innerHTML = '';
+			if (sig) {
+				this.curEl.appendChild(E('div', { 'class': 'hv-cur' }, [
+					cur ? flagEl(f.code) : flagEl('', true),
+					E('div', { 'class': 'hv-nm' }, [E('b', {}, cur ? f.name : 'Авто'), E('span', {}, subt)])
+				]));
+			}
 		}
 
-		/* статистика */
-		this.statsEl.innerHTML = '';
+		/* статистика: каркас строится один раз, дальше обновляются только значения.
+		   Полная пересборка каждые 3 секунды теряла фокус и сбрасывала disabled
+		   у кнопки «Проверить» раньше, чем замер успевал завершиться. */
 		if (ph === 'on') {
 			var ck = this.check || {}, ip = ck.ip || st.ip;
-			var cell = function (icon, label, val, small) {
-				return E('div', { 'class': 'hv-stat' }, [E('span', {}, [ic(icon), label]), E('b', { title: val }, val), E('small', {}, small || '')]);
-			};
 			var tgt = sel !== 'auto' ? sel : (st.active || '');
 			var pd = tgt && S.delays ? S.delays[tgt] : undefined;
 			var delay = typeof pd === 'number' ? pd : (typeof ck.delay === 'number' ? ck.delay : null);
-			this.statsEl.appendChild(E('div', { 'class': 'hv-stats' }, [
-				cell('zap', 'Пинг', delay != null ? delay + ' мс' : '—'),
-				cell('globe', 'IP', ipText(ip)),
-				cell('down', 'Получено', fmtBytes(st.down), this.rate.down > 0 ? fmtBytes(this.rate.down) + '/с' : ''),
-				cell('up', 'Отправлено', fmtBytes(st.up), this.rate.up > 0 ? fmtBytes(this.rate.up) + '/с' : '')
-			]));
-			this.statsEl.appendChild(E('div', { 'class': 'hv-actions' }, [
-				E('button', { type: 'button', 'class': 'hv-btn ghost sm', title: 'Замерить пинг и определить IP заново',
-					click: function (ev) { me.doRecheck(ev.currentTarget); } }, [ic('refresh'), E('span', {}, 'Проверить')])
-			]));
+			if (!this._statRefs) {
+				var cell = function (key, icon, label) {
+					var val = E('b'), small = E('small');
+					me._statRefs[key] = { v: val, s: small };
+					return E('div', { 'class': 'hv-stat' }, [E('span', {}, [ic(icon), label]), val, small]);
+				};
+				this._statRefs = {};
+				this.statsEl.innerHTML = '';
+				this.statsEl.appendChild(E('div', { 'class': 'hv-stats' }, [
+					cell('ping', 'zap', 'Пинг'),
+					cell('ip', 'globe', 'IP'),
+					cell('down', 'down', 'Получено'),
+					cell('up', 'up', 'Отправлено')
+				]));
+				this.statsEl.appendChild(E('div', { 'class': 'hv-actions' }, [
+					E('button', { type: 'button', 'class': 'hv-btn ghost sm', title: 'Замерить пинг и определить IP заново',
+						click: function (ev) { me.doRecheck(ev.currentTarget); } }, [ic('refresh'), E('span', {}, 'Проверить')])
+				]));
+			}
+			var R = this._statRefs;
+			R.ping.v.textContent = delay != null ? delay + ' мс' : '—';
+			R.ip.v.textContent = ipText(ip);
+			R.ip.v.setAttribute('title', ipText(ip));
+			R.down.v.textContent = fmtBytes(st.down);
+			R.down.s.textContent = this.rate.down > 0 ? fmtBytes(this.rate.down) + '/с' : '';
+			R.up.v.textContent = fmtBytes(st.up);
+			R.up.s.textContent = this.rate.up > 0 ? fmtBytes(this.rate.up) + '/с' : '';
+		} else if (this._statRefs) {
+			this._statRefs = null;
+			this.statsEl.innerHTML = '';
 		}
 
 		/* ошибка */
@@ -925,11 +954,15 @@ return view.extend({
 	connect: function () {
 		var self = this;
 		if (!this.servers().length) { this.toast('Сначала добавьте ссылку', true); return; }
-		if (this.busy && this.busy.kind === 'on') return;
+		if (this.busy) return;
+		this._gen = (this._gen || 0) + 1;   /* отменяет устаревшие ответы state/status */
 		this.busy = { kind: 'on', since: Date.now() };
 		this.check = null;
 		this.pinged = false;
-		this.S.status = Object.assign({}, this.S.status, { error: '', phase: 'starting' });
+		/* connected сбрасываем явно: phase() проверяет его первым, и со старым
+		   значением=true кнопка продолжала показывать «Подключено» с протухшими
+		   счётчиками всё время, пока туннель пересоздавался. */
+		this.S.status = Object.assign({}, this.S.status, { connected: false, running: false, error: '', phase: 'starting' });
 		this.updatePower();
 		this.drawBanners();
 		rConnect().then(function (r) {
@@ -943,6 +976,8 @@ return view.extend({
 
 	disconnect: function () {
 		var self = this;
+		if (this.busy && this.busy.kind === 'off') return;   /* повторное нажатие игнорируем */
+		this._gen = (this._gen || 0) + 1;
 		this.busy = { kind: 'off', since: Date.now() };
 		this.updatePower();
 		rDisconnect().then(function () {
@@ -1094,11 +1129,16 @@ return view.extend({
 	doPingOne: function (id, btn) {
 		var self = this;
 		if (!id) { this.toast('Сначала выберите сервер или подключитесь', true); return; }
+		/* Защита от повторного клика: без неё крутилка жила на уже удалённом узле,
+		   а новая кнопка оставалась кликабельной и запускала второй замер. */
+		if (this._pingingOne) return;
+		this._pingingOne = true;
 		this.pingOne = id;
 		this.drawList();
 		if (btn) { btn.classList.add('spin'); btn.disabled = true; }
 		var done = function () {
 			self.pingOne = null;
+			self._pingingOne = false;
 			if (btn) { btn.classList.remove('spin'); btn.disabled = false; }
 		};
 		var pingFn = (this.phase() === 'on') ? function () { return rPingOne(id); } : function () { return rPingOneDirect(id); };
@@ -1114,8 +1154,10 @@ return view.extend({
 
 	/* ───── опрос ───── */
 
-	applyStatus: function (r) {
+	applyStatus: function (r, gen) {
 		var prevPhase = this.phase(), now = Date.now();
+		/* Ответ, запрошенный до последнего действия, не должен откатывать интерфейс назад */
+		if (gen !== undefined && gen !== this._gen) return;
 		/* скорость по разнице счётчиков */
 		if (r.connected && this._prev && now > this._prev.t && r.down >= this._prev.down && r.up >= this._prev.up) {
 			var dt = (now - this._prev.t) / 1000;
@@ -1128,7 +1170,11 @@ return view.extend({
 			if (r.connected) {
 				this.busy = null;
 				this.toast('VPN подключён');
-			} else if (r.phase === 'error' || (r.phase === 'off' && now - this.busy.since > 4000)) {
+			} else if (r.phase === 'error' || (r.phase === 'off' && now - this.busy.since > CONNECT_TIMEOUT)) {
+				/* Порог — CONNECT_TIMEOUT, а не 4 секунды: cmd_connect сначала рвёт
+				   туннель и ждёт его освобождения до 15 с, поэтому «off» в первые
+				   секунды — это нормальный перезапуск, а не ошибка. С коротким порогом
+				   сохранение настроек при активном VPN всегда показывало фантомную ошибку. */
 				this.failConnect(r.error || 'Служба остановилась сразу после запуска. Смотрите вкладку «Журнал».');
 				return;
 			}
@@ -1141,23 +1187,27 @@ return view.extend({
 	},
 
 	pollStatus: function () {
-		var self = this;
+		var self = this, gen = this._gen;
 		if (this._polling) return;
 		this._polling = true;
 		withRetry(rStatus).then(function (r) {
 			self._polling = false;
-			if (r && typeof r === 'object') self.applyStatus(r);
+			if (r && typeof r === 'object') self.applyStatus(r, gen);
 		}).catch(function () { self._polling = false; });
 	},
 
 	refreshAll: function () {
-		var self = this;
+		var self = this, gen = this._gen;
 		withRetry(rState).then(function (st) {
 			if (!st) return;
+			/* Ответ, запрошенный до последнего действия, игнорируем: иначе он
+			   откатывал бы оптимистичные изменения и уводил интерфейс в ошибку. */
+			if (gen !== self._gen) return;
 			self.loadFailed = false;
 			self.S = st;
 			self.afterState();
 		}).catch(function () {
+			if (gen !== self._gen) return;
 			if (!self.servers().length) { self.loadFailed = true; self.drawBanners(); }
 		});
 	},

@@ -38,7 +38,7 @@ find "$W/data" "$W/ctl" -type f -exec sed -i 's/\r$//' {} +
 cat > "$W/ctl/control" <<C
 Package: luci-vless-selective
 Version: $VER
-Depends: luci-base, rpcd, sing-box, kmod-tun, curl, jq, ca-bundle, ip-full
+Depends: luci-base, rpcd, sing-box, kmod-tun, curl, jq, ca-bundle, ip-full, nftables
 Section: luci
 Architecture: all
 Maintainer: $(sed -n 's/^PKG_MAINTAINER:=//p' Makefile)
@@ -61,9 +61,34 @@ cat > "$W/ctl/prerm" <<'C'
 /etc/init.d/vless disable >/dev/null 2>&1
 exit 0
 C
-chmod 0755 "$W/ctl/postinst" "$W/ctl/prerm"
+cat > "$W/ctl/postrm" <<'C'
+#!/bin/sh
+# Удаление пакета: чистим сеть и конфигурацию. openwrt передаёт код в $1
+# (remove | purge | upgrade), поэтому ключи удаляются только при purge.
+[ -n "$IPKG_INSTROOT" ] && exit 0
+[ -x /usr/bin/vless ] && /usr/bin/vless net-down >/dev/null 2>&1
+# Конфиг удаляем только при purge: при обычном remove настройки должны пережить переустановку.
+[ "$1" = "purge" ] && rm -f /etc/config/vless
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
+/etc/init.d/firewall reload >/dev/null 2>&1
+exit 0
+C
+chmod 0755 "$W/ctl/postinst" "$W/ctl/prerm" "$W/ctl/postrm"
 ( cd "$W/ctl" && tar --owner=0 --group=0 --numeric-owner -czf "$W/control.tar.gz" . )
 ( cd "$W/data" && tar --owner=0 --group=0 --numeric-owner -czf "$W/data.tar.gz" . )
 echo 2.0 > "$W/debian-binary"
 ( cd "$W" && ar -cr "$OUT/luci-vless-selective_${VER}_all.ipk" debian-binary data.tar.gz control.tar.gz )
+
+# 3) Контрольные суммы. Архив устанавливается под root прямо на роутер, поэтому
+# пользователь должен иметь возможность сверить то, что скачал.
+# Список файлов собирается циклом: «zip» может не собраться, и падать на этом
+# нельзя — остальные артефакты всё равно полезны.
+( cd "$OUT" || exit 1
+	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk"; do
+		[ -f "$f" ] || continue
+		sha256sum "$f"
+	done > SHA256SUMS
+	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk"; do
+		if [ -f "$f" ]; then sha256sum "$f" > "$f.sha256"; fi
+	done )
 ls -l "$OUT"

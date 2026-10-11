@@ -16,6 +16,12 @@ module.exports = function (scenario) {
     state: function () { return JSON.parse(JSON.stringify(state())); },
     status: function () { return JSON.parse(JSON.stringify(st)); },
     connect: function () { if (sc === 'fail') return { ok: false, error: 'Не установлен sing-box. Установите: opkg install sing-box' };
+      /* Сценарий 'restart' повторяет реальность cmd_connect: он сначала рвёт туннель,
+         и status какое-то время отвечает phase:'off'. Раньше интерфейс через 4 секунды
+         объявлял это ошибкой, хотя туннель штатно поднимался. */
+      if (sc === 'restart') { st.running = false; st.connected = false; st.phase = 'off';
+        setTimeout(function () { st.running = true; st.phase = 'starting'; }, 7000);
+        setTimeout(function () { st.connected = true; st.phase = 'on'; st.uptime = 0; st.error = ''; }, 9000); return { ok: true, starting: true }; }
       st.running = true; st.phase = 'starting'; setTimeout(function () { st.connected = true; st.phase = 'on'; st.uptime = 0; st.error = ''; }, 2500); return { ok: true, starting: true }; },
     disconnect: function () { st.running = false; st.connected = false; st.phase = 'off'; return { ok: true }; },
     add: function (t) { return t.indexOf('bad') >= 0 ? { ok: false, error: 'Не удалось распознать ссылку.' } : { ok: true, kind: 'sub', name: 'Тест', added: 5 }; },

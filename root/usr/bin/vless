@@ -76,8 +76,40 @@ valid_cidr() { # IP или IP/маска (0–32)
 	valid_ip "${1%%/*}"
 }
 
-write_atomic() { # write_atomic FILE  (stdin); файл читается только root
-	( umask 077; cat > "$1.tmp" ) && mv "$1.tmp" "$1"
+# Записать вывод команды в FILE атомарно и только при успешном коде возврата.
+# Важно: НЕ «jq … | write_atomic» — в конвейере доступен код возврата только
+# последней команды (cat), и упавший jq молча затирал бы базу пустым файлом.
+atomic_run() { # atomic_run FILE КОМАНДА [АРГУМЕНТЫ…]
+	local f="$1"; shift
+	( umask 077; "$@" > "$f.tmp" ) || { rm -f "$f.tmp"; return 1; }
+	mv "$f.tmp" "$f"
+}
+
+atomic_text() { # atomic_text FILE ТЕКСТ
+	local f="$1" t="$2"
+	( umask 077; printf '%s' "$t" > "$f.tmp" ) || { rm -f "$f.tmp"; return 1; }
+	mv "$f.tmp" "$f"
+}
+
+# Ограничение числа одновременно запущенных дочерних процессов: подписка на
+# сотни серверов иначе поднимает тысячи процессов и роутер с 64 МБ уходит в OOM.
+JOBS_MAX="${VLESS_JOBS_MAX:-8}"
+pids=""
+
+# join_jobs — дождаться фоновых задач, если их уже больше JOBS_MAX, и обнулить список.
+# Вызывающий код накапливает pid'ы в $pids.
+join_jobs() {
+	[ "$(printf '%s' "$pids" | wc -w)" -gt "$JOBS_MAX" ] || return 0
+	local p
+	for p in $pids; do wait "$p" 2>/dev/null; done
+	pids=""
+}
+
+# join_all — дождаться всех накопленных фоновых задач.
+join_all() {
+	local p
+	for p in $pids; do wait "$p" 2>/dev/null; done
+	pids=""
 }
 
 # Блокировка: команды, меняющие серверы/настройки, не должны выполняться одновременно
@@ -174,27 +206,45 @@ cmd_set() {
 			auto_tolerance) { echo "$v" | grep -qE '^[0-9]{1,4}$' && [ "$v" -le 1000 ]; } || bad=1 ;;
 			auto_test_url)  case "$v" in http://*|https://*) ;; *) bad=1 ;; esac ;;
 			user_agent)     { [ ${#v} -le 80 ] && [ -n "$v" ]; } || bad=1 ;;
+			# Значение с переводом строки разбивается на несколько строк при чтении,
+			# и вторая строка стала бы произвольным ключом UCI. Неизвестный ключ — отказ.
+			*)              bad=1 ;;
 		esac
 		if [ "$bad" = 1 ]; then echo "$k" >> "$rej"; continue; fi
 		uci set "vless.main.$k=$v"
 	done
 
-	# списки
+	# списки. Значения сначала проверяются целиком и только потом перезаписывается список:
+	# раньше uci delete шёл первым, и сбой на середине оставлял опцию пустой безвозвратно.
 	for k in direct_domains proxy_domains presets devices ifaces; do
-		if printf '%s\n' "$data" | jq -e --arg k "$k" 'has($k)' >/dev/null 2>&1; then
-			uci -q delete "vless.main.$k"
-			printf '%s\n' "$data" | jq -r --arg k "$k" '.[$k][]? | tostring' | while read -r line; do
-				[ -n "$line" ] || continue
-				case "$k" in
-					devices)  valid_cidr "$line" || { echo "$k: $line" >> "$rej"; continue; } ;;
-					presets)  case " $PRESET_KEYS " in *" $line "*) ;; *) continue ;; esac ;;
-					ifaces)   echo "$line" | grep -qE '^[A-Za-z0-9_]{1,15}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
-					*)        echo "$line" | grep -qE '^[A-Za-z0-9.*/:_-]{1,100}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
-				esac
-				uci add_list "vless.main.$k=$line"
-			done
+		printf '%s\n' "$data" | jq -e --arg k "$k" 'has($k)' >/dev/null 2>&1 || continue
+		# элемент с переводом строки разбился бы на несколько записей списка
+		if ! printf '%s\n' "$data" | jq -e --arg k "$k" \
+			'[.[$k][]? | tostring | select(contains("\n") or contains("\r"))] | length == 0' >/dev/null 2>&1; then
+			echo "$k (значение с переводом строки)" >> "$rej"; continue
 		fi
+		: > "$RUN/list.ok"
+		printf '%s\n' "$data" | jq -r --arg k "$k" '.[$k][]? | tostring' | while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			case "$k" in
+				devices)  valid_cidr "$line" || { echo "$k: $line" >> "$rej"; continue; } ;;
+				presets)  case " $PRESET_KEYS " in *" $line "*) ;; *) continue ;; esac ;;
+				ifaces)   echo "$line" | grep -qE '^[A-Za-z0-9_]{1,15}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
+				*)        echo "$line" | grep -qE '^[A-Za-z0-9.*/:_-]{1,100}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
+			esac
+			printf '%s\n' "$line" >> "$RUN/list.ok"
+		done
+		# пустой результат при непустом вводе = всё отброшено проверкой: старый список цел
+		if [ ! -s "$RUN/list.ok" ] && [ "$(printf '%s\n' "$data" | jq -r --arg k "$k" '[.[$k][]?]|length')" -gt 0 ]; then
+			continue
+		fi
+		uci -q delete "vless.main.$k"
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			uci add_list "vless.main.$k=$line"
+		done < "$RUN/list.ok"
 	done
+	rm -f "$RUN/list.ok"
 	uci commit vless
 
 	if printf '%s\n' "$data" | jq -e 'has("autostart")' >/dev/null 2>&1; then
@@ -217,12 +267,23 @@ sync_cron() {
 	local n f="${VLESS_CRON:-/etc/crontabs/root}"
 	n="$(cfg update_interval 24)"
 	mkdir -p "$(dirname "$f")"
-	[ -f "$f" ] || touch "$f"
-	grep -v '/usr/bin/vless update-all' "$f" > "$f.tmp" 2>/dev/null
+	[ -f "$f" ] || { touch "$f"; chmod 600 "$f" 2>/dev/null; }
+	# grep -v отнимает 1 и когда строк просто не осталось (в crontab была только наша
+	# запись) — это норма. Код 2 означает настоящую ошибку: при ней $f.tmp пуст,
+	# и все чужие задания cron были бы стёрты. Поэтому проверяем код, а не пустой файл.
+	grep -v -F '/usr/bin/vless update-all' "$f" > "$f.tmp" 2>/dev/null
+	grc=$?
+	if [ "$grc" -gt 1 ]; then
+		rm -f "$f.tmp"
+		logger -t vless "не удалось обновить crontab: $f недоступен для чтения" 2>/dev/null
+		return 1
+	fi
 	if [ "$n" -gt 0 ] 2>/dev/null; then
 		echo "$(cron_spec "$n") /usr/bin/vless update-all >/dev/null 2>&1" >> "$f.tmp"
 	fi
 	if ! cmp -s "$f" "$f.tmp"; then
+		# Права OpenWrt на /etc/crontabs/root — 0600; после mv они не должны меняться.
+		chmod --reference="$f" "$f.tmp" 2>/dev/null || chmod 600 "$f.tmp" 2>/dev/null
 		mv "$f.tmp" "$f"
 		[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
 	else
@@ -238,11 +299,18 @@ autostart_on() { ls /etc/rc.d/S*vless >/dev/null 2>&1; }
 # Панели с лимитом устройств считают по нему, поэтому он не должен меняться между обновлениями.
 get_hwid() {
 	local f="$DIR/hwid"
+	# Создание идёт через временный файл с link(), иначе два параллельных вызова
+	# (например, cmd_state без блокировки и скачивание подписки) оба увидели бы
+	# пустой файл и записали разные HWID — панель увидела бы «новое устройство»
+	# и лимит устройств у пользователя сбрасывался бы.
 	if [ ! -s "$f" ]; then
-		tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16 > "$f"
-		chmod 600 "$f" 2>/dev/null
+		( umask 077; tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16 > "$f.new" ) 2>/dev/null
+		if [ -s "$f.new" ]; then
+			[ -s "$f" ] || ln "$f.new" "$f" 2>/dev/null || mv "$f.new" "$f"
+			rm -f "$f.new"
+		fi
 	fi
-	cat "$f"
+	cat "$f" 2>/dev/null
 }
 
 # sub_curl [аргументы curl] URL — curl с заголовками Happ для Android.
@@ -277,12 +345,14 @@ is_stub() {
 		grep -qE 'не поддерж|не подде|unsupported|not supported|update (your )?(app|client)|обновите|устарел'
 }
 
-# base64 без регулярных выражений: на многих роутерах jq собран без Oniguruma
+# base64 без регулярных выражений: на многих роутерах jq собран без Oniguruma.
+# Замена через split/join, а не explode: explode разворачивал подписку в массив из
+# миллиона чисел, и на роутере с 64 МБ jq уходил в OOM на большой подписке.
 b64dec() {
-	jq -R -s -r 'explode
-		| map(if . == 45 then 43 elif . == 95 then 47 else . end)
-		| map(select(. != 61 and . != 32 and . != 9 and . != 10 and . != 13))
-		| implode
+	jq -R -s -r 'split("\n") | join("") | split("\r") | join("")
+		| split(" ") | join("") | split("\t") | join("")
+		| split("-") | join("+") | split("_") | join("/")
+		| split("=") | join("")
 		| . + ("===="[0: ((4 - (length % 4)) % 4)]) | @base64d' 2>>"$RUN/parse.err"
 }
 
@@ -345,14 +415,14 @@ merge_servers() { # merge_servers SRC MODE(replace|append)  — удалённы
 	# потому что id — это md5, и сервера «прыгали» бы при каждом обновлении.
 	local ud='def ud: reduce .[] as $x ([]; if any(.[]; .id == $x.id) then . else . + [$x] end); '
 	if [ "$2" = "replace" ]; then
-		jq -c -s --arg src "$1" --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] | map(select(.source != $src))) + (.[1:] | ud)) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
+		atomic_run "$SERVERS" jq -c -s --arg src "$1" --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] | map(select(.source != $src))) + (.[1:] | ud)) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
 	else
-		jq -c -s --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] + .[1:]) | ud) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
-	fi | write_atomic "$SERVERS"
+		atomic_run "$SERVERS" jq -c -s --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] + .[1:]) | ud) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
+	fi
 }
 
 upsert_source() { # upsert_source JSON
-	jq -c --argjson o "$1" 'map(select(.id != $o.id)) + [$o]' "$SOURCES" | write_atomic "$SOURCES"
+	atomic_run "$SOURCES" jq -c --argjson o "$1" 'map(select(.id != $o.id)) + [$o]' "$SOURCES"
 }
 
 hdr() { # hdr FILE NAME
@@ -360,7 +430,7 @@ hdr() { # hdr FILE NAME
 }
 
 add_sub() { # add_sub URL
-	local url="$1" sid body hf title info n tsv now
+	local url="$1" sid body hf title info n now
 	sid="$(printf '%s' "$url" | md5sum | cut -c1-8)"
 	body="$RUN/sub.body"; hf="$RUN/sub.hdr"
 	if ! fetch_url "$url" "$body" "$hf"; then
@@ -434,7 +504,15 @@ unwrap_link() {
 
 cmd_add() {
 	local text res
-	text="$(printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+	# Текст можно передать аргументом (как раньше, для ручной отладки) или через stdin.
+	# rpcd-плагин передаёт именно через stdin: argv виден всем локальным пользователям
+	# в /proc/*/cmdline, а там — полные ключи и токены подписок.
+	if [ -n "$1" ]; then
+		text="$(printf '%s' "$1" | tr -d '\r')"
+	else
+		text="$(cat | tr -d '\r')"
+	fi
+	text="$(printf '%s' "$text" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
 	# Ссылку-«обёртку» распаковываем только если вставлена ровно одна строка.
 	# Проверяем через wc, а не шаблон case с переводом строки: результат command
 	# substitution всегда обрезает хвостовые переводы строк, и такой шаблон
@@ -457,7 +535,14 @@ cmd_add() {
 cmd_refresh() { # refresh [ID]
 	local ids id url res ok=0 fail=0 before after last=""
 	before="$(md5sum < "$SERVERS")"
-	if [ -n "$1" ] && [ "$1" != "all" ]; then ids="$1"; else ids="$(jq -r '.[]|select(.kind=="sub")|.id' "$SOURCES")"; fi
+	if [ -n "$1" ] && [ "$1" != "all" ]; then
+		# id проверяем и не разворачиваем: без кавычек значение превращалось
+		# в список файлов и в несколько id через пробелы.
+		echo "$1" | grep -qE '^[0-9a-z]{4,8}$' || { json_err "Некорректный id"; return 1; }
+		ids="$1"
+	else
+		ids="$(jq -r '.[]|select(.kind=="sub")|.id' "$SOURCES")"
+	fi
 	for id in $ids; do
 		url="$(jq -r --arg id "$id" '.[]|select(.id==$id and .kind=="sub")|.url' "$SOURCES")"
 		[ -n "$url" ] || continue
@@ -474,24 +559,37 @@ cmd_refresh() { # refresh [ID]
 	jq -n -c --argjson ok "$ok" --argjson fail "$fail" --arg e "${last:-}" '{ok:($fail==0),updated:$ok,failed:$fail,error:$e}'
 }
 
+# Обновление по cron: наружу не отдаём ничего, но неудачу пишем в системный журнал.
+# Раньше ошибка просто терялась вместе с stdout, и сломанная подписка выглядела
+# как «давно не обновлялось» без всяких признаков.
+cmd_update_all() {
+	local r
+	r="$(cmd_refresh all)"
+	[ "$(printf '%s' "$r" | jq -r '.ok')" = "true" ] && return 0
+	logger -t vless "автообновление: не удалось обновить $(
+		printf '%s' "$r" | jq -r '.failed' 2>/dev/null) подписок(и). $(
+		printf '%s' "$r" | jq -r '.error' 2>/dev/null | cut -c1-160)" 2>/dev/null
+	return 0
+}
+
 cmd_remove() { # remove ID (источник или одиночный сервер)
 	local id="$1" sel
 	echo "$id" | grep -qE '^[0-9a-z]{4,8}$' || { json_err "Некорректный id"; return 1; }
 	if [ "$(jq --arg id "$id" '[.[]|select(.id==$id)]|length' "$SOURCES")" != "0" ]; then
-		jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES" | write_atomic "$SOURCES"
-		jq -c --arg id "$id" 'map(select(.source != $id))' "$SERVERS" | write_atomic "$SERVERS"
+		atomic_run "$SOURCES" jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES"
+		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.source != $id))' "$SERVERS"
 		# вместе с подпиской забываем и список удалённых из неё серверов
-		jq -c --arg id "$id" 'map(select(.source != $id))' "$HIDDEN" | write_atomic "$HIDDEN"
+		atomic_run "$HIDDEN" jq -c --arg id "$id" 'map(select(.source != $id))' "$HIDDEN"
 	else
 		# удалённый сервер подписки запоминаем, чтобы он не вернулся при обновлении
 		local ssrc; ssrc="$(jq -r --arg id "$id" '[.[]|select(.id==$id)][0].source // empty' "$SERVERS")"
 		if [ -n "$ssrc" ] && [ "$ssrc" != "manual" ]; then
-			jq -c --arg id "$id" --arg src "$ssrc" '(map(select(.id != $id)) + [{id:$id,source:$src}])' "$HIDDEN" | write_atomic "$HIDDEN"
+			atomic_run "$HIDDEN" jq -c --arg id "$id" --arg src "$ssrc" '(map(select(.id != $id)) + [{id:$id,source:$src}])' "$HIDDEN"
 		fi
-		jq -c --arg id "$id" 'map(select(.id != $id))' "$SERVERS" | write_atomic "$SERVERS"
+		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.id != $id))' "$SERVERS"
 		# обновить счётчик «Мои ключи»
-		jq -c --argjson n "$(jq '[.[]|select(.source=="manual")]|length' "$SERVERS")" \
-			'map(if .id=="manual" then .count=$n else . end) | map(select(.id!="manual" or .count>0))' "$SOURCES" | write_atomic "$SOURCES"
+		atomic_run "$SOURCES" jq -c --argjson n "$(jq '[.[]|select(.source=="manual")]|length' "$SERVERS")" \
+			'map(if .id=="manual" then .count=$n else . end) | map(select(.id!="manual" or .count>0))' "$SOURCES"
 	fi
 	sel="$(cfg selected auto)"
 	if [ "$sel" != "auto" ] && [ "$(jq --arg s "$sel" '[.[]|select(.id==$s)]|length' "$SERVERS")" = "0" ]; then
@@ -506,7 +604,7 @@ cmd_remove() { # remove ID (источник или одиночный серв�
 }
 
 cmd_clear() {
-	echo '[]' > "$SERVERS"; echo '[]' > "$SOURCES"; echo '[]' > "$HIDDEN"
+	atomic_text "$SERVERS" '[]'; atomic_text "$SOURCES" '[]'; atomic_text "$HIDDEN" '[]'
 	uci set vless.main.selected=auto; uci commit vless
 	is_running && /etc/init.d/vless stop >/dev/null 2>&1
 	jq -n -c '{ok:true}'
@@ -535,6 +633,7 @@ resolve_vpn_targets() {
 	command -v timeout >/dev/null 2>&1 && to="timeout 5"
 	rm -rf "$RUN/res"; mkdir -p "$RUN/res"; : > "$out.tmp"
 	jq -r '.[] | select(.supported==true and .outbound!=null) | [.server, (.outbound.type // "x"), (.port|tostring)] | @tsv' "$SERVERS" 2>/dev/null | sort -u > "$RUN/vpn_hosts.tsv"
+	pids=""
 	while IFS="$TAB" read -r host typ port; do
 		[ -n "$host" ] && [ -n "$port" ] || continue
 		proto=tcp; case "$typ" in hysteria2|hysteria|tuic|wireguard) proto=udp ;; esac
@@ -543,9 +642,11 @@ resolve_vpn_targets() {
 		else
 			( $to nslookup "$host" "$bs" 2>/dev/null | awk '/^Name:/{f=1;next} f&&/^Address/{print}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' |
 				while read -r ip; do echo "$ip $proto $port"; done > "$RUN/res/$(printf '%s' "$host$port" | md5sum | cut -c1-12)" ) &
+			pids="$pids $!"
+			join_jobs
 		fi
 	done < "$RUN/vpn_hosts.tsv"
-	wait
+	join_all
 	cat "$RUN"/res/* >> "$out.tmp" 2>/dev/null
 	sort -u "$out.tmp" > "$out"; rm -rf "$out.tmp" "$RUN/res" "$RUN/vpn_hosts.tsv"
 }
@@ -566,10 +667,12 @@ cmd_prepare() {
 			--arg secret "$secret" --arg selected "$(cfg selected auto)" --arg logfile "$RUN/sing-box.log" 2>&1 > "$CONFIG.tmp")"; then
 		set_error "$(echo "$out" | head -n3 | tr '\n' ' ')"; rm -f "$CONFIG.tmp"; return 1
 	fi
-	mv "$CONFIG.tmp" "$CONFIG"; chmod 600 "$CONFIG"
-	if ! out="$(sing-box check -c "$CONFIG" 2>&1)"; then
-		set_error "Конфиг не прошёл проверку: $(echo "$out" | head -n3 | tr '\n' ' ')"; return 1
+	# Сначала проверяем временный файл и только потом заменяем рабочий: иначе
+	# невалидный конфиг оставался бы на месте и ломал бы следующий запуск.
+	if ! out="$(sing-box check -c "$CONFIG.tmp" 2>&1)"; then
+		set_error "Конфиг не прошёл проверку: $(echo "$out" | head -n3 | tr '\n' ' ')"; rm -f "$CONFIG.tmp"; return 1
 	fi
+	mv "$CONFIG.tmp" "$CONFIG"; chmod 600 "$CONFIG"
 	: > "$RUN/sing-box.log"
 	rm -f "$RUN/up_since" "$RUN/ip.json"
 	if cfgb bypass_vpn 1; then resolve_vpn_targets; else rm -f "$RUN/vpn_targets"; fi
@@ -598,7 +701,7 @@ cmd_connect() {
 	done
 	if ! is_running; then
 		json_err "$(cat "$RUN/last_error" 2>/dev/null | grep . || echo 'Не удалось запустить sing-box. Смотрите вкладку «Журнал».')"
-		return 0
+		return 1
 	fi
 	jq -n -c '{ok:true,starting:true}'
 }
@@ -629,23 +732,56 @@ rotate_log() { # если лог больше 5 МБ — обрезаем, ос�
 cmd_run() {
 	rm -f "$RUN/up_since" "$RUN/ip.json"
 	rotate_log
+	# net_up ждёт появления туннеля до 40 с, поэтому его pid запоминаем: иначе
+	# «Отключить» в этот момент удалял бы ещё не созданные правила, а net_up затем
+	# добавил бы их после остановки службы, уведя трафик в мёртвый туннель.
 	( net_up ) >/dev/null 2>&1 &
+	printf '%s\n' "$!" > "$RUN/net_up.pid"
 	exec sing-box run -D "$RUN" -c "$CONFIG"
 }
 
-del_rules() { # del_rules [-6]
+# net_up_running — идёт ли ещё настройка сети; net_down обязан дождаться её.
+net_up_running() {
 	local p
-	for p in $(ip $1 rule show 2>/dev/null | awk -F: '$1+0>=9000 && $1+0<9200 {print $1+0}' | sort -u); do
+	p="$(cat "$RUN/net_up.pid" 2>/dev/null)"
+	[ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+RULE_PREFS="$RUN/rule.prefs"
+
+# note_pref — запомнить pref только что добавленного правила.
+# Удалять будем ровно свои правила: срез «весь диапазон 9000–9199» сносил чужие
+# правила других пакетов (mwan3, второй VPN и т.п.).
+note_pref() { printf '%s\n' "$1" >> "$RULE_PREFS"; }
+
+del_rules() { # del_rules [-6]
+	# Свои правила: записанные pref + всё, что однозначно наше (наша таблица 100,
+	# наш интерфейс vless0, наше unreachable-правило для IPv6).
+	local p
+	[ -f "$RULE_PREFS" ] || : > "$RULE_PREFS"
+	for p in $(cat "$RULE_PREFS"; ip $1 rule show 2>/dev/null | awk -F: -v tbl "$TABLE" -v tun "$TUN" '
+		$1+0>=9000 && $1+0<9200 && (index($0, "lookup " tbl) || index($0, tun) || (index($0, "unreachable") && index($0, "iif")))
+		{print $1+0}' | sort -un); do
 		while ip $1 rule del pref "$p" 2>/dev/null; do :; done
 	done
+	: > "$RULE_PREFS"
 }
 
 dnsmasq_dir() {
-	local s d
-	s="$(uci -q show dhcp.@dnsmasq[0] 2>/dev/null | head -n1 | sed 's/^dhcp\.\([^=]*\)=.*/\1/')"
-	d="/tmp/dnsmasq.$s.d"
-	[ -d "$d" ] && { echo "$d"; return; }
-	ls -d /tmp/dnsmasq.*.d 2>/dev/null | head -n1
+	# Настоящий каталог из dnsmasq.init: /tmp/dnsmasq${cfg:+.$cfg}.d, где cfg — имя секции.
+	# У секции без имени cfg пуст, поэтому каталог называется просто /tmp/dnsmasq.d:
+	# его не покрывает шаблон /tmp/dnsmasq.*.d (там обязателен непустой средний сегмент),
+	# и не покрывает имя секции вида @dnsmasq[0].
+	local name d
+	name="$(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^=]*\)=dnsmasq$/\1/p' | head -n1)"
+	d="/tmp/dnsmasq${name:+.$name}.d"
+	[ -d "$d" ] && { echo "$d"; return 0; }
+	[ -d /tmp/dnsmasq.d ] && { echo /tmp/dnsmasq.d; return 0; }
+	# секцию могли переименовать — берём любой существующий каталог dnsmasq
+	for d in /tmp/dnsmasq*.d; do
+		[ -d "$d" ] && { echo "$d"; return 0; }
+	done
+	return 0
 }
 
 net_fail() { # net_fail СООБЩЕНИЕ — запомнить причину и остановить сервис (без перезапусков procd)
@@ -733,6 +869,13 @@ selective_up() {
 				[ -n "$one" ] && nft add element inet vless "$SEL_SET" "{ $one }" 2>/dev/null
 			done
 	fi
+	# Если в наборе пусто, маркировать нечего: трафик пойдёт мимо туннеля, но VPN
+	# покажет себя подключённым. Честнее сообщить об этом, чем вернуть 0.
+	if [ -z "$c" ] && ! printf '%s\n' "$lines" | grep -q '^D '; then
+		logger -t vless "выборочный режим: нет ни доменов, ни подсетей — трафик в туннель не пойдёт (проверьте «Настройки → Маршрутизация»)" 2>/dev/null
+		rm -f "$RUN/nftset.conf"; nft delete table inet vless 2>/dev/null
+		return 1
+	fi
 	return 0
 }
 
@@ -743,9 +886,12 @@ selective_down() {
 
 net_up() {
 	local i=0 n p net st addr mask dev ip ifs
+	# Пока идёт настройка, служба уже может быть остановлена — тогда продолжать нельзя,
+	# иначе правила появятся после net_down.
 	while [ $i -lt 40 ]; do
+		net_up_running || return 0
 		ip link show "$TUN" >/dev/null 2>&1 && break
-		pid_alive || [ $i -lt 3 ] || exit 1
+		pid_alive || [ $i -lt 3 ] || return 0
 		sleep 1; i=$((i + 1))
 	done
 	if ! ip link show "$TUN" >/dev/null 2>&1; then
@@ -764,14 +910,15 @@ net_up() {
 	# локальные и служебные сети всегда идут мимо туннеля
 	p=9000
 	for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 224.0.0.0/4; do
-		ip rule add to "$net" lookup main pref $p; p=$((p + 1))
+		ip rule add to "$net" lookup main pref $p 2>/dev/null && note_pref $p
+		p=$((p + 1))
 	done
 
 	# выборочный режим: метим только пакеты к адресам набора vpn4; при неудаче — обычный режим
 	local sel=0
 	if [ "$(cfg scope all)" = selected ] && selective_up; then
 		sel=1
-		ip rule add fwmark $SEL_MARK lookup $TABLE pref 9100
+		ip rule add fwmark $SEL_MARK lookup $TABLE pref 9100 2>/dev/null && note_pref 9100
 	fi
 
 	ifs="$(uci -q get vless.main.ifaces 2>/dev/null)"; [ -n "$ifs" ] || ifs="lan"
@@ -784,7 +931,7 @@ net_up() {
 		[ -n "$addr" ] && [ -n "$mask" ] && subnets="$subnets $addr/$mask"
 		[ -n "$dev" ] && devs="$devs $dev"
 	done
-	for net in $subnets; do ip rule add to "$net" lookup main pref 9020; done
+	for net in $subnets; do ip rule add to "$net" lookup main pref 9020 2>/dev/null && note_pref 9020; done
 
 	# Если ни один интерфейс не разрешился, то ни одного ip rule не будет: трафик уйдёт мимо
 	# туннеля, а блокировка IPv6 (цикл ниже по $devs) не применится. Молчать здесь нельзя —
@@ -800,8 +947,11 @@ net_up() {
 		local tp tport
 		while read -r ip tp tport; do
 			[ -n "$ip" ] && [ -n "$tport" ] || continue
+			# BusyBox ip не умеет ipproto/dport, поэтому первый вариант обычно не проходит:
+			# тогда весь трафик к IP VPN-сервера идёт мимо туннеля (а не только его трафик).
 			ip rule add to "$ip" ipproto "$tp" dport "$tport" lookup main pref 9030 2>/dev/null ||
 				ip rule add to "$ip" lookup main pref 9030 2>/dev/null
+			note_pref 9030
 		done < "$RUN/vpn_targets"
 	fi
 
@@ -809,24 +959,29 @@ net_up() {
 	case "$(cfg mode all)" in
 		include)
 			for ip in $(uci -q get vless.main.devices 2>/dev/null); do
-				valid_cidr "$ip" && ip rule add from "$ip" lookup $TABLE pref 9100
+				valid_cidr "$ip" && { ip rule add from "$ip" lookup $TABLE pref 9100 2>/dev/null && note_pref 9100; }
 			done ;;
 		exclude)
 			for ip in $(uci -q get vless.main.devices 2>/dev/null); do
-				valid_cidr "$ip" && ip rule add from "$ip" lookup main pref 9050
+				valid_cidr "$ip" && { ip rule add from "$ip" lookup main pref 9050 2>/dev/null && note_pref 9050; }
 			done
-			for net in $subnets; do ip rule add from "$net" lookup $TABLE pref 9100; done ;;
+			for net in $subnets; do ip rule add from "$net" lookup $TABLE pref 9100 2>/dev/null && note_pref 9100; done ;;
 		*)
-			for net in $subnets; do ip rule add from "$net" lookup $TABLE pref 9100; done ;;
+			for net in $subnets; do ip rule add from "$net" lookup $TABLE pref 9100 2>/dev/null && note_pref 9100; done ;;
 	esac
 	fi
 
-	# IPv6 в туннель не отправляем — закрываем во всех режимах, иначе он утечёт мимо VPN
+	# IPv6 в туннель не отправляем — закрываем во всех режимах, иначе он утечёт мимо VPN.
+	# Ошибка здесь означает утечку IPv6, поэтому подтверждаем успех явно.
 	if cfgb block_ipv6 1; then
+		local v6ok=1
 		for dev in $devs; do
-			for net in fe80::/10 fc00::/7 ff00::/8; do ip -6 rule add iif "$dev" to "$net" lookup main pref 9090 2>/dev/null; done
-			ip -6 rule add iif "$dev" unreachable pref 9100 2>/dev/null
+			for net in fe80::/10 fc00::/7 ff00::/8; do
+				ip -6 rule add iif "$dev" to "$net" lookup main pref 9090 2>/dev/null && note_pref 9090
+			done
+			if ip -6 rule add iif "$dev" unreachable pref 9100 2>/dev/null; then note_pref 9100; else v6ok=0; fi
 		done
+		[ "$v6ok" = 1 ] || logger -t vless "не удалось заблокировать IPv6 (нужен пакет ip-full): трафик IPv6 может идти мимо VPN" 2>/dev/null
 	fi
 
 	# DNS: dnsmasq спрашивает sing-box (через VPN); в выборочном режиме он же заполняет набор адресов
@@ -840,12 +995,20 @@ net_up() {
 		} > "$d/vless.conf"
 		chmod 644 "$d/vless.conf"
 		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	else
+		# Раньше этот случай проходил молча: VPN показывался подключённым, но DNS уходил
+		# мимо туннеля, а набор адресов выборочного режима оставался пустым.
+		logger -t vless "не найден каталог конфигурации dnsmasq: DNS через VPN и выборочная маршрутизация не настроены (проверьте, запущен ли dnsmasq)" 2>/dev/null
 	fi
 	date +%s > "$RUN/up_since"
+	rm -f "$RUN/net_up.pid"
 }
 
 net_down() {
-	local d f
+	local d f i=0
+	# Дождаться, пока net_up закончит: иначе он добавит правила уже после их удаления.
+	while net_up_running && [ $i -lt 45 ]; do sleep 1; i=$((i + 1)); done
+	rm -f "$RUN/net_up.pid"
 	del_rules; del_rules -6
 	ip route flush table $TABLE 2>/dev/null
 	selective_down
@@ -946,7 +1109,7 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 	fi
 	r="$(ping_all_servers)"
 	printf '%s' "$r" | jq -e 'type=="object"' >/dev/null 2>&1 || r='{}'
-	printf '%s' "$r" > "$RUN/delays.json"
+	atomic_text "$RUN/delays.json" "$r"
 	# Если не ответил ни один сервер — это честная неудача, а не «обновилось»
 	jq -n -c --slurpfile d "$RUN/delays.json" \
 		'($d[0] | length) as $n
@@ -954,15 +1117,17 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 		   else {ok:true,delays:$d[0],count:$n} end'
 }
 
-# ping_direct [ID] — прямой пинг до сервера без VPN (curl, TCP connect + TLS handshake)
-# Меряет время установления соединения до server:port — хороший прокси для «как далеко сервер».
+# ping_direct [ID] — прямой пинг до сервера без VPN
+# Меряет время установления TCP-соединения до server:port — хороший прокси для «как далеко сервер».
+# curl печатает %{time_connect} даже при неудаче, поэтому код возврата проверяется явно:
+# иначе недоступный сервер получал бы правдоподобный «пинг».
 ping_one_direct() { # ping_one_direct HOST PORT -> мс или ""
 	local host="$1" port="$2" t url
 	case "$port" in
 		80) url="http://$host" ;;
 		*)  url="https://$host:$port" ;;
 	esac
-	t="$(curl -so /dev/null -m 6 -w '%{time_connect}' "$url" 2>/dev/null || echo "")"
+	t="$(curl -so /dev/null -m 6 -w '%{time_connect}' "$url" 2>/dev/null)" || t=""
 	if [ -n "$t" ] && printf '%s' "$t" | grep -qE '^[0-9]+\.[0-9]+$'; then
 		awk -v t="$t" 'BEGIN{printf "%d", t*1000}'
 	fi
@@ -990,14 +1155,16 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 	fi
 	# параллельный пинг всех серверов (через файлы: <(...) не работает в sh)
 	jq -r '.[]|[.id,.server,(.port|tostring)]|@tsv' "$SERVERS" 2>/dev/null > "$RUN/pingtab"
-	local pids="" result="{}" s
+	local result="{}" n=0 p
+	pids=""
 	while IFS="$TAB" read -r id host port; do
 		[ -n "$id" ] && [ -n "$host" ] && [ -n "$port" ] || continue
 		( ms="$(ping_one_direct "$host" "$port")"; printf '%s\t%s\n' "$id" "${ms:-FAIL}" > "$RUN/pingd.$id" ) &
 		pids="$pids $!"
+		join_jobs
 	done < "$RUN/pingtab"
 	rm -f "$RUN/pingtab"
-	for p in $pids; do wait "$p" 2>/dev/null; done
+	join_all
 	cat "$RUN"/pingd.* 2>/dev/null > "$RUN/pingres"
 	while IFS="$TAB" read -r id ms; do
 		[ -n "$id" ] || continue
@@ -1009,8 +1176,12 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 	done < "$RUN/pingres"
 	rm -f "$RUN/pingres"
 	rm -f "$RUN"/pingd.*
-	printf '%s' "$result" > "$RUN/delays.json"
-	jq -n -c --slurpfile d "$RUN/delays.json" '{ok:true,delays:$d[0],direct:true}'
+	atomic_text "$RUN/delays.json" "$result"
+	# Как и в cmd_ping: если не ответил никто — это честная неудача, а не «обновилось».
+	n="$(printf '%s' "$result" | jq -r 'length')"
+	jq -n -c --slurpfile d "$RUN/delays.json" --argjson n "$n" \
+		'(if $n == 0 then {ok:false,error:"Ни один сервер не ответил напрямую (проверьте подключение к интернету)"}
+		  else {ok:true,delays:$d[0],count:$n} end) + {direct:true}'
 }
 
 cmd_status() {
@@ -1044,10 +1215,17 @@ cmd_status() {
 
 cmd_state() {
 	local delays='{}'
-	[ -s "$RUN/delays.json" ] && delays="$(cat "$RUN/delays.json")"
+	# Битый delays.json не должен ломать весь ответ интерфейса.
+	[ -s "$RUN/delays.json" ] && printf '%s' "$delays" | jq -e . >/dev/null 2>&1 && delays="$(cat "$RUN/delays.json")"
+	# URL подписки содержит токен доступа. Метод state доступен на чтение любому
+	# пользователю LuCI с доступом к приложению, поэтому наружу отдаём только хост:
+	# интерфейс всё равно URL не показывает, а ключи всех подписок хранятся в пути.
+	# Разбор без регулярных выражений — jq на роутерах часто без Oniguruma.
 	jq -n -c \
 		--argjson servers "$(jq -c 'map(del(.outbound))' "$SERVERS")" \
-		--argjson sources "$(cat "$SOURCES")" \
+		--argjson sources "$(jq -c 'map(if .url then .url = ((.url | split("://")) as $p
+			| if ($p|length) > 1 then ($p[0] + "://" + ($p[1] | split("/")[0])) else "<скрыто>" end)
+			else . end)' "$SOURCES")" \
 		--argjson settings "$(settings_json)" \
 		--argjson status "$(cmd_status)" \
 		--argjson delays "$delays" \
@@ -1105,7 +1283,9 @@ case "$1" in
 	add)        shift; locked cmd_add "$1" ;;
 	remove)     locked cmd_remove "$2" ;;
 	refresh)    locked cmd_refresh "$2" ;;
-	update-all) locked cmd_refresh all >/dev/null ;;
+	# Результат не показывается (команда вызывается из cron), но о неудаче
+	# обязан остаться след: иначе битая подписка годами выглядит как «просто не обновилось».
+	update-all) locked cmd_update_all ;;
 	select)     locked cmd_select "$2" ;;
 	set)        locked cmd_set ;;
 	clear)      locked cmd_clear ;;
@@ -1115,8 +1295,11 @@ case "$1" in
 	ping-direct) cmd_ping_direct "$2" ;;
 	devices)    cmd_devices ;;
 	logs)       cmd_logs ;;
-	connect)    cmd_connect ;;
-	disconnect) cmd_disconnect ;;
+	# connect/disconnect тоже сериализуем: без этого автообновление по cron
+	# могло перезапустить службу поверх ручного подключения (и наоборот).
+	# prepare блокировку не берёт, поэтому рекурсии и дедлока нет.
+	connect)    locked cmd_connect ;;
+	disconnect) locked cmd_disconnect ;;
 	prepare)    cmd_prepare ;;
 	run)        cmd_run ;;
 	net-up)     net_up ;;

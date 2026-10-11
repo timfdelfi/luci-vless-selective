@@ -3,18 +3,75 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Тесты
+  lint:
+    name: Проверка стиля
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Установить jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Установить jq и shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+
+      # shellcheck находит цитирование и ошибки в sh бесплатно; на 10 файлов это секунды.
+      # SC3043: local нет в POSIX, но есть в BusyBox ash — целевой интерпретатор.
+      # SC2034: в init.d START/STOP/USE_PROCD читает procd, а не этот скрипт.
+      - name: shellcheck
+        run: |
+          shopt -s nullglob
+          files="$(git ls-files '*.sh') $(git ls-files root/usr/bin/vless root/etc/init.d/vless root/usr/libexec/rpcd/vless root/etc/uci-defaults/'*' tests/mock/*)"
+          echo "$files"
+          shellcheck -s sh -S warning -e SC3043,SC2034 $files
+
+      - name: sh -n (синтаксис всех скриптов)
+        run: |
+          for f in $(git ls-files '*.sh' | grep -v '\.bat$'); do sh -n "$f" || exit 1; done
+          for f in root/usr/bin/vless root/etc/init.d/vless root/usr/libexec/rpcd/vless tests/mock/uci tests/mock/api/curl; do
+            sh -n "$f" || exit 1
+          done
+
+      # jq на роутерах часто собран без Oniguruma, поэтому проверяем компилируемость
+      # и то, что скрипты не используют регулярные выражения.
+      - name: jq: компилируемость и отсутствие регулярных выражений
+        run: sh ci/check-jq.sh
+
+      - name: Проверить переводы строк (LF)
+        run: sh ci/check-lf.sh
+
+      - name: node --check для интерфейса
+        run: node --check htdocs/luci-static/resources/view/vless/main.js
+
+  test:
+    name: Тесты
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить зависимости
+        run: sudo apt-get update && sudo apt-get install -y jq python3
+
+      # Единственная проверка, что сгенерированный конфиг вообще валиден, раньше
+      # никогда не выполнялась: sing-box в CI не стоял, и run.sh её пропускал.
+      - name: Установить sing-box
+        run: |
+          VER=1.12.0
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          sudo install -m 0755 "/tmp/sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
 
       - name: Прогнать тесты
         run: sh tests/run.sh
@@ -22,6 +79,7 @@ jobs:
   ui:
     name: Тесты интерфейса
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -48,15 +106,13 @@ jobs:
   package:
     name: Сборка пакетов
     runs-on: ubuntu-latest
-    needs: [test, ui]
+    timeout-minutes: 15
+    needs: [lint, test, ui]
     steps:
       - uses: actions/checkout@v4
 
       - name: Установить зависимости сборки
         run: sudo apt-get update && sudo apt-get install -y jq binutils zip
-
-      - name: Проверить переводы строк (LF)
-        run: sh ci/check-lf.sh
 
       - name: Собрать
         run: sh build.sh
@@ -67,5 +123,51 @@ jobs:
           ar t "$IPK" | grep -q debian-binary || { echo "НЕ ar-архив"; exit 1; }
           echo "ok: $(ar t "$IPK" | tr '\n' ' ')"
 
+      - name: Проверить, что скрипты в пакете исполняемые
+        run: |
+          cd dist && rm -rf _x && mkdir _x && cd _x
+          tar xzf ../data.tar.gz
+          for f in ./usr/bin/vless ./usr/libexec/rpcd/vless ./etc/init.d/vless; do
+            [ -x "$f" ] || { echo "НЕ исполняемый: $f"; exit 1; }
+          done
+          echo "ok: права 0755 на месте"
+
       - name: Проверить, что файлы собраны (dist)
         run: ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    name: Релиз
+    # Тег без буквы v (как случилось с 1.3.2) больше не соберёт релиз молча.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [package]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить зависимости сборки
+        run: sudo apt-get update && sudo apt-get install -y jq binutils zip
+
+      - name: Проверить, что тег совпадает с VERSION
+        run: |
+          VER="$(cat VERSION)"
+          [ "v$VER" = "${{ github.ref_name }}" ] || { echo "Тег ${{ github.ref_name }} не совпадает с VERSION=$VER"; exit 1; }
+
+      - name: Собрать
+        run: sh build.sh
+
+      - name: Опубликовать
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vless-vpn.tar.gz
+            dist/vless-vpn.zip
+            dist/*.ipk
+            dist/*.sha256

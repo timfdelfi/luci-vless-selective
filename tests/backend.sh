@@ -28,6 +28,10 @@ a_names="$($H state | jq -r '[.servers[].name]|join(",")')"
 [ "$b_names" = "$a_names" ] && ok "названия серверов не переставляются" || bad "названия переставились"
 r="$($H add 'просто мусор')"
 t "add: мусор отклонён с понятной ошибкой" "$r" '.ok==false and (.error|length)>10'
+# rpcd передаёт текст через stdin: argv виден всем локальным пользователям
+# в /proc/*/cmdline, а там полные ключи и токены подписки.
+r="$(cat tests/links.txt | $H add)"
+t "add через stdin (как это делает rpcd)" "$r" '.ok==true and .added==7'
 r="$($H add '')"
 t "add: пустой ввод отклонён" "$r" '.ok==false'
 r="$($H state)"
@@ -68,7 +72,10 @@ python3 tests/subserver.py 18765 tests/links.txt & SP=$!
 sleep 1
 r="$($H add http://127.0.0.1:18765/sub)"
 t "подписка: добавлена, имя из Profile-Title" "$r" '.ok==true and .kind=="sub" and .name=="Тест" and .added==7'
+# state читается любым пользователем LuCI с доступом к приложению, поэтому токен
+# из пути подписки наружу отдаваться не должен — остаётся только хост.
 r="$($H state)"
+t "токен подписки не утекает через state" "$r" '[.sources[]|select(.kind=="sub")][0].url=="http://127.0.0.1:18765"'
 t "подписка: остаток трафика и срок" "$r" '[.sources[]|select(.kind=="sub")][0] | .total==10737418240 and .upload==1048576 and .download==2097152 and .expire==1893456000'
 sid="$(printf '%s' "$r" | jq -r '[.sources[]|select(.kind=="sub")][0].id')"
 sv="$(printf '%s' "$r" | jq -r --arg s "$sid" '[.servers[]|select(.source==$s)][0].id')"
@@ -90,6 +97,8 @@ echo "== подписка в base64 (Xray-JSON)"
 # Раньше формат определялся ДО декодирования, поэтому base64(Xray-JSON)
 # уходил в режим links и пользователь получал «серверов не найдено».
 eval "$(sed -n '/^b64dec()/,/^}/p;/^body_format()/,/^}/p;/^body_to_tsv()/,/^}/p' root/usr/bin/vless)"
+# Анализатор считает LIB неиспользуемой, но она нужна функции body_to_tsv,
+# которая подтягивается eval'ом — такие строки статический анализ не разбирает.
 RUN="$VLESS_RUN"; LIB="$VLESS_LIB"; mkdir -p "$RUN"
 XJ='{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"b64.example.com","port":8443,"users":[{"id":"11111111-2222-3333-4444-555555555555","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"b64.example.com"},"wsSettings":{"path":"/b64","headers":{"Host":"cdn.b64.example.com"}}}}]}'
 printf '%s' "$XJ" | jq -R -s -r 'explode | map(select(. != 10 and . != 13)) | implode | @base64' > "$W/sub.b64"

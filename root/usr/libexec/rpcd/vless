@@ -49,7 +49,15 @@ JSON
 			ping-direct)
 				run ping-direct "$(arg id)" ;;
 			add)
-				run add "$(arg text)" ;;
+				# Текст со ссылками идёт через stdin, а не через аргумент командной строки:
+				# argv виден всем локальным пользователям в /proc/*/cmdline, а там —
+				# полные ключи vless и токены подписок.
+				out="$(printf '%s' "$IN" | jq -j '.text // empty' 2>/dev/null | "$VLESS" add 2>/dev/null)"
+				if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+					printf '%s\n' "$out"
+				else
+					printf '{"ok":false,"error":"Не удалось добавить серверы"}\n'
+				fi ;;
 			set)
 				out="$(printf '%s' "$IN" | jq -c '.settings // {}' | "$VLESS" set 2>/dev/null)"
 				if [ -n "$out" ]; then printf '%s\n' "$out"; else echo '{"ok":false,"error":"Не удалось сохранить настройки"}'; fi ;;

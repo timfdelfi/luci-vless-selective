@@ -63,6 +63,22 @@ const text = (page) => page.evaluate(() => document.body.innerText);
   ok(errors.length === 0, 'нет ошибок в консоли ' + errors.join('; '));
   await page.context().close();
 
+  console.log('== перезапуск туннеля не выглядит ошибкой');
+  /* cmd_connect сначала останавливает службу и ждёт освобождения туннеля, поэтому
+     status несколько секунд отвечает phase:'off'. Это штатный перезапуск, а не сбой:
+     раньше интерфейс показывал «Служба остановилась сразу после запуска». */
+  ({ page, errors } = await open(browser, 'restart'));
+  await page.click('.hv-pb');
+  await page.waitForTimeout(5200);
+  let rt = await text(page);
+  ok(!/Служба остановилась сразу после запуска/.test(rt), 'нет фантомной ошибки во время штатного перезапуска');
+  ok(!/Ошибка подключения/.test(rt), 'нет статуса «Ошибка подключения» во время перезапуска');
+  ok(/Подключение/.test(rt), 'показан статус «Подключение…»');
+  await page.waitForTimeout(5200);
+  ok(/Подключено/.test(await text(page)), 'после перезапуска туннель поднялся');
+  ok(errors.length === 0, 'нет ошибок в консоли ' + errors.join('; '));
+  await page.context().close();
+
   console.log('== пинг: анимация, кнопки, отсутствие кружка');
   ({ page, errors } = await open(browser, 'connected'));
   ok(await page.locator('.hv-ck').count() === 0, 'кружок с галочкой удалён');
@@ -72,6 +88,16 @@ const text = (page) => page.evaluate(() => document.body.innerText);
   const widths = await page.locator('.hv-row .hv-ms').evaluateAll(
     els => els.map(e => Math.round(e.getBoundingClientRect().width)));
   ok(widths.length > 0 && new Set(widths).size === 1, 'колонка пинга одной ширины — цифры не прыгают');
+  /* Панель статистики перерисовывается каждые 3 секунды. Если бы каркас строился заново,
+     фокус с кнопки «Проверить» падал бы на <body> — для клавиатуры это поломка. */
+  await page.locator('.hv-actions button').focus();
+  await page.waitForTimeout(4200);
+  ok(await page.evaluate(() => document.activeElement && document.activeElement.className.includes('hv-btn')),
+     'фокус не теряется при перерисовке статистики');
+  ok(await page.evaluate(() => {
+    const b = document.querySelector('.hv-actions button');
+    return !!b && !b.disabled;
+  }), 'кнопка «Проверить» доступна после нескольких циклов опроса');
   await page.context().close();
 
   // с задержкой на ответе видно анимацию замера

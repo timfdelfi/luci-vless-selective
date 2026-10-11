@@ -9,7 +9,7 @@ PKG_LICENSE:=MIT
 
 LUCI_TITLE:=VPN для OpenWrt: вставил ссылку, нажал кнопку, работает
 LUCI_DESCRIPTION:=Простой VPN-клиент для OpenWrt (sing-box, TUN). Подписки, VLESS/VMess/Trojan/SS/Hysteria2, автовыбор сервера.
-LUCI_DEPENDS:=+luci-base +sing-box +kmod-tun +curl +jq +ca-bundle +ip-full
+LUCI_DEPENDS:=+luci-base +sing-box +kmod-tun +curl +jq +ca-bundle +ip-full +nftables
 LUCI_PKGARCH:=all
 
 PKG_FILE_MODES:=/usr/bin/vless:root:root:0755 \

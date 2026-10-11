@@ -55,6 +55,11 @@ cj "QUIC режется только у выбранных"            '[.route.
 cj "исключение пользователя раньше прокси-правил" '([.route.rules[]|.outbound=="direct" and has("domain_suffix")]|index(true)) < ([.route.rules[]|.outbound=="proxy" and has("domain_suffix")]|index(true))'
 cfg="$(build "{$B,\"scope\":\"selected\",\"presets\":[\"nope\"]}")"
 cj "неизвестный пресет игнорируется"            '.route.final=="direct" and ([.route.rules[]|select(.outbound=="proxy")]|length)==0'
+# Пользователь пишет «*.example.org». nft-часть снимала «*.», а sing-box-конфиг
+# оставлял «*.example.org», и sing-box check падал — кнопка «Подключить» не работала.
+cfg="$(build "{$B,\"scope\":\"selected\",\"proxy_domains\":[\"*.foo.org\",\"example.net\"],\"direct_domains\":[\"*.direct.org\"]}")"
+cj "«*.» снимается и в sing-box-конфиге"        '[.route.rules[] | (.domain_suffix // [])[]] | (index("*.foo.org")|not) and (index("foo.org")!=null)'
+cj "«*.» снимается и в исключениях"             '.route.rules | any(.outbound=="direct" and (.domain_suffix|index("*.direct.org")|not) and (.domain_suffix|index("direct.org")))'
 cfg="$(build "{$B,\"scope\":\"all\",\"bypass_ru\":true,\"presets\":[\"telegram\"]}")"
 cj "режим «всё»: пресеты не влияют, final=proxy" '.route.final=="proxy" and .dns.final=="dns-remote" and ([.route.rules[]|select(.outbound=="proxy")]|length)==0'
 cj "режим «всё, кроме РФ»: .ru напрямую"        '.route.rules | any(.outbound=="direct" and (.domain_suffix|index(".ru")))'
