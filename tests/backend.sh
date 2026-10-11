@@ -18,6 +18,14 @@ t() { j "$2" "$3" && ok "$1" || { bad "$1"; printf '       получено: %s\
 echo "== добавление и состояние"
 r="$($H add "$(cat tests/links.txt)")"
 t "add: 7 серверов из текста со ссылками" "$r" '.ok==true and .added==7'
+# unique_by() переставлял весь список (id — это md5), и сервера «прыгали» при каждом добавлении
+b_order="$($H state | jq -r '[.servers[].id]|join(",")')"
+b_names="$($H state | jq -r '[.servers[].name]|join(",")')"
+$H add "$(sed -n '1p' tests/links.txt)" >/dev/null
+a_order="$($H state | jq -r '[.servers[].id]|join(",")')"
+a_names="$($H state | jq -r '[.servers[].name]|join(",")')"
+[ "$b_order" = "$a_order" ] && ok "порядок серверов не ломается при повторном добавлении" || bad "порядок серверов: $b_order -> $a_order"
+[ "$b_names" = "$a_names" ] && ok "названия серверов не переставляются" || bad "названия переставились"
 r="$($H add 'просто мусор')"
 t "add: мусор отклонён с понятной ошибкой" "$r" '.ok==false and (.error|length)>10'
 r="$($H add '')"
@@ -78,6 +86,20 @@ kill $SP 2>/dev/null; wait $SP 2>/dev/null
 r="$($H add http://127.0.0.1:18765/sub)"
 t "подписка недоступна: понятная ошибка" "$r" '.ok==false and (.error|startswith("Не удалось скачать"))'
 
+echo "== подписка в base64 (Xray-JSON)"
+# Раньше формат определялся ДО декодирования, поэтому base64(Xray-JSON)
+# уходил в режим links и пользователь получал «серверов не найдено».
+eval "$(sed -n '/^b64dec()/,/^}/p;/^body_format()/,/^}/p;/^body_to_tsv()/,/^}/p' root/usr/bin/vless)"
+RUN="$VLESS_RUN"; LIB="$VLESS_LIB"; mkdir -p "$RUN"
+XJ='{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"b64.example.com","port":8443,"users":[{"id":"11111111-2222-3333-4444-555555555555","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"b64.example.com"},"wsSettings":{"path":"/b64","headers":{"Host":"cdn.b64.example.com"}}}}]}'
+printf '%s' "$XJ" | jq -R -s -r 'explode | map(select(. != 10 and . != 13)) | implode | @base64' > "$W/sub.b64"
+r="$(body_to_tsv "$W/sub.b64" 2>/dev/null)"
+printf '%s\n' "$r" | cut -f2 | jq -e '.outbound.server=="b64.example.com" and .outbound.transport.path=="/b64"' >/dev/null 2>&1 \
+	&& ok "base64(Xray-JSON) распознан" || bad "base64(Xray-JSON) не распознан"
+printf '%s' "$XJ" > "$W/sub.json"
+printf '%s\n' "$(body_to_tsv "$W/sub.json" 2>/dev/null)" | cut -f2 | jq -e '.outbound.type=="vless"' >/dev/null 2>&1 \
+	&& ok "обычный Xray-JSON по-прежнему распознаётся" || bad "обычный Xray-JSON"
+
 echo "== прочее"
 r="$($H status)"
 t "status: выключено, без ошибки" "$r" '.running==false and .phase=="off" and .error==""'
@@ -91,7 +113,17 @@ t "clear: пусто" "$($H state)" '(.servers|length)==0 and (.sources|length)=
 
 echo "== rpcd-плагин"
 RP="sh $ROOT/root/usr/libexec/rpcd/vless"
-$RP list | jq -e 'has("connect") and has("set") and has("ping")' >/dev/null && ok "list: валидный JSON с методами" || bad "list"
+$RP list | jq -e 'has("connect") and has("set") and has("ping") and has("ping-direct")' >/dev/null && ok "list: валидный JSON с методами" || bad "list"
+# Каждый метод, который вызывает интерфейс, обязан быть в списке rpcd, иначе ubus его не отдаст.
+miss=""
+for m in $(sed -n "s/.*H('\([a-z-]*\)'.*/\1/p" "$ROOT/htdocs/luci-static/resources/view/vless/main.js" | sort -u); do
+	$RP list | jq -e --arg m "$m" 'has($m)' >/dev/null 2>&1 || miss="$miss $m"
+done
+[ -z "$miss" ] && ok "все методы интерфейса есть в rpcd list" || bad "в rpcd list нет:$miss"
+$RP list | jq -r 'keys[]' | while read -r m; do
+	grep -q "\"$m\"" "$ROOT/root/usr/share/rpcd/acl.d/luci-vless-selective.json" || echo "acl: нет $m"
+done > "$W/acl.miss" 2>/dev/null
+[ -s "$W/acl.miss" ] && bad "методы без прав в ACL: $(tr '\n' ' ' < "$W/acl.miss")" || ok "все методы разрешены в ACL"
 r="$(echo '{}' | VLESS_BIN="$ROOT/root/usr/bin/vless" $RP call status)"
 t "call status: проксируется" "$r" 'has("running")'
 r="$(echo '{}' | VLESS_BIN=/nonexistent $RP call state)"
@@ -109,6 +141,13 @@ printf '%s\n' "$L" | grep -qx 'D example.net' && ok "списки: свой до
 printf '%s\n' "$L" | grep -qx 'C 203.0.113.7' && ok "списки: свой IP попадает в подсети" || bad "списки: свой IP попадает в подсети"
 printf '%s\n' "$L" | grep -qx 'D foo.org' && ok "списки: звёздочка *. снимается" || bad "списки: звёздочка *. снимается"
 printf '%s\n' "$L" | grep -q 'discord' && bad "списки: невыбранный пресет не попадает" || ok "списки: невыбранный пресет не попадает"
+# Набор vpn4 объявлен ipv4_addr: одна IPv6-запись раньше роняла nft add element
+# целиком и отключала ВСЕ подсети разом.
+printf '%s' '{"scope":"selected","presets":["telegram"],"proxy_domains":["example.net","2001:db8::/32"],"mode":"all","devices":[]}' | $H set >/dev/null
+L="$($H selective-lists)"
+printf '%s\n' "$L" | grep -qx 'C 149.154.160.0/20' && ok "подсети пресета целы несмотря на IPv6-запись" || bad "подсети пресета потеряны"
+printf '%s\n' "$L" | grep -q '2001:db8' && bad "IPv6 попал в набор ipv4_addr" || ok "IPv6 отфильтрован из списка подсетей"
+printf '%s\n' "$L" | grep -qx 'C 95.161.64.0/20' && ok "новый диапазон Telegram на месте" || bad "нет диапазона 95.161.64.0/20"
 N="$($H selective-nft)"
 printf '%s\n' "$N" | grep -q 'meta mark set 0x64' && ok "nft: правило пометки есть" || bad "nft: правило пометки есть"
 if command -v nft >/dev/null 2>&1 && printf '%s\n' "$N" | nft -c -f - >/dev/null 2>&1; then ok "nft: синтаксис принят nft -c"

@@ -27,6 +27,7 @@ case "$1" in
 	"disconnect": {},
 	"check":      {},
 	"ping":       { "id": "string" },
+	"ping-direct": { "id": "string" },
 	"clear":      {},
 	"clearlog":   {},
 	"add":        { "text": "string" },
@@ -45,6 +46,8 @@ JSON
 				run "$2" ;;
 			ping|remove|refresh|select)
 				run "$2" "$(arg id)" ;;
+			ping-direct)
+				run ping-direct "$(arg id)" ;;
 			add)
 				run add "$(arg text)" ;;
 			set)

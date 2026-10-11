@@ -8,7 +8,8 @@ USE_PROCD=1
 PIDFILE=/var/run/vless.pid
 
 start_service() {
-	[ "$(jq 'length' /etc/vless/servers.json 2>/dev/null)" -gt 0 ] 2>/dev/null || {
+	# stderr от jq глушим сами: перенаправление на [ ниже его не покрывает
+	[ -s /etc/vless/servers.json ] && [ "$(jq 'length' /etc/vless/servers.json 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null || {
 		mkdir -p /var/run/vless
 		echo "Нет серверов — добавьте ссылку в разделе Службы → VPN" > /var/run/vless/last_error 2>/dev/null
 		return 0

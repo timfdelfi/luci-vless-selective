@@ -19,10 +19,36 @@ jobs:
       - name: Прогнать тесты
         run: sh tests/run.sh
 
+  ui:
+    name: Тесты интерфейса
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Установить Playwright и Chromium
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: Прогнать тесты интерфейса и перерисовать скриншоты
+        run: node tests/ui/shot.js
+
+      - name: Приложить скриншоты
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots
+          path: tests/ui/out/
+          if-no-files-found: ignore
+
   package:
     name: Сборка пакетов
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, ui]
     steps:
       - uses: actions/checkout@v4
 

@@ -24,6 +24,7 @@ module.exports = function (scenario) {
     set: function (s) { Object.assign(settings, s); return { ok: true, ignored: s.mtu === 1234 ? ['mtu'] : [] }; },
     check: function () { return { ok: true, delay: 41, ip: st.ip }; },
     ping: function (id) { return id ? { ok: true, ms: 55, delays: delays } : { ok: true, delays: delays }; },
+    'ping-direct': function (id) { return id ? { ok: true, ms: 47, delays: delays, direct: true } : { ok: true, delays: delays, direct: true }; },
     devices: function () { return { devices: [{ ip: '192.168.1.20', mac: 'aa', name: 'iPhone-Anna' }, { ip: '192.168.1.31', mac: 'bb', name: 'DESKTOP-PC' }, { ip: '192.168.1.44', mac: 'cc', name: '' }] }; },
     logs: function () { return { log: '== sing-box ==\\n+0300 2026-10-09 21:40:01 INFO inbound/tun[tun-in]: started at vless0\\n+0300 2026-10-09 21:40:09 WARN outbound/vless[s-a0000002]: connection timeout\\n+0300 2026-10-09 21:40:12 ERROR dns: exchange failed\\n\\n== system ==\\nOct  9 21:40:00 router vless: net-up ok\\n' }; },
     clear: function () { return { ok: true }; }, clearlog: function () { return { ok: true }; }

@@ -1,5 +1,7 @@
 // Скриншоты и проверки интерфейса в headless Chromium.
-//   NODE_PATH=/opt/npm-tools/node_modules node tests/ui/shot.js [outdir]
+//   sh build-docs.sh            — Linux
+//   npx playwright install chromium && node tests/ui/shot.js [outdir]
+// Своё расположение браузера можно задать переменной PW_CHROMIUM.
 const { chromium } = require('playwright');
 const fs = require('fs'), path = require('path');
 const root = path.join(__dirname, '..', '..');
@@ -26,7 +28,9 @@ async function open(browser, scenario, { w = 1280, h = 900, dark = false, lag } 
 const text = (page) => page.evaluate(() => document.body.innerText);
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium', args: ['--no-sandbox'] });
+  const launchOpts = { args: ['--no-sandbox'] };
+  if (process.env.PW_CHROMIUM) launchOpts.executablePath = process.env.PW_CHROMIUM;
+  const browser = await chromium.launch(launchOpts);
 
   console.log('== подключено, светлая тема');
   let { page, errors } = await open(browser, 'connected');
@@ -63,6 +67,13 @@ const text = (page) => page.evaluate(() => document.body.innerText);
   ({ page, errors } = await open(browser, 'off', { dark: true }));
   await page.screenshot({ path: out + '/off_dark.png' });
   ok(/Отключено/.test(await text(page)), 'статус «Отключено»');
+  // Без работающего туннеля пинг должен идти по прямому каналу (метод ping-direct)
+  await page.click('.hv-pingall');
+  await page.waitForTimeout(400);
+  ok(await page.evaluate(() => window.__calls.some(c => c.startsWith('ping-direct'))),
+     'без VPN пинг идёт через ping-direct');
+  ok(await page.evaluate(() => window.__calls.filter(c => c.startsWith('ping-direct')).length === 1),
+     'прямой пинг вызвал ровно один раз');
   await page.click('.hv-pb');
   await page.waitForTimeout(400);
   ok(/Подключение…/.test(await text(page)), 'после клика — «Подключение…»');
@@ -122,6 +133,13 @@ const text = (page) => page.evaluate(() => document.body.innerText);
   ok(/часть значений отклонена: mtu/.test(await text(page)), 'отклонённые бэкендом значения показаны');
   ok(await page.evaluate(() => window.__calls.some(c => c.startsWith('connect'))), 'при работающем VPN сохранение перезапускает туннель');
   ok(errors.length === 0, 'нет ошибок в консоли ' + errors.join('; '));
+  await page.context().close();
+
+  console.log('== настройки, тёмная тема');
+  ({ page } = await open(browser, 'connected', { h: 1000, dark: true }));
+  await page.click('.hv-tabs button:nth-child(2)');
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: out + '/settings_dark.png', fullPage: true });
   await page.context().close();
 
   console.log('== журнал');

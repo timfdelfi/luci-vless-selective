@@ -5,7 +5,7 @@
 			"ubus": { "vless": [ "state", "status", "devices", "logs" ] }
 		},
 		"write": {
-			"ubus": { "vless": [ "add", "remove", "refresh", "select", "set", "connect", "disconnect", "check", "ping", "clear", "clearlog" ] }
+			"ubus": { "vless": [ "add", "remove", "refresh", "select", "set", "connect", "disconnect", "check", "ping", "ping-direct", "clear", "clearlog" ] }
 		}
 	}
 }

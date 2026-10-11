@@ -4,15 +4,20 @@
 
 def presets: {
   telegram: {
-    domains: ["telegram.org", "t.me", "telegram.me", "telegra.ph", "telesco.pe", "tdesktop.com",
-              "telegram-cdn.org", "cdn-telegram.org", "tg.dev"],
-    # Telegram ходит по IP-адресам напрямую (звонки, MTProto), одних доменов мало
+    domains: ["telegram.org", "t.me", "telegram.me", "telegram-cdn.org", "cdn-telegram.org",
+              "tdesktop.com", "telesco.pe", "telegra.ph", "tg.dev"],
+    # Telegram ходит по IP-адресам напрямую (звонки, MTProto, загрузка медиа),
+    # одних доменов мало. 91.108.4–20 — основные DC, 91.108.56 — DC5,
+    # 91.105.192 и 149.154.160 — запасные диапазоны, 185.76.151 — статика,
+    # 95.161.64 — отдельный диапазон MTProxy/загрузки файлов.
     cidrs: ["91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
-            "91.108.56.0/22", "91.105.192.0/23", "149.154.160.0/20", "185.76.151.0/24"]
+            "91.108.56.0/22", "91.105.192.0/23", "149.154.160.0/20", "185.76.151.0/24",
+            "95.161.64.0/20"]
   },
   youtube: {
     domains: ["youtube.com", "youtu.be", "youtube-nocookie.com", "youtubekids.com",
-              "googlevideo.com", "ytimg.com", "ggpht.com", "youtubei.googleapis.com"]
+              "googlevideo.com", "ytimg.com", "ggpht.com", "youtubei.googleapis.com",
+              "jnn-pa.googleapis.com"]
   },
   discord: {
     domains: ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media",

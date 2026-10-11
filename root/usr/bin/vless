@@ -289,25 +289,41 @@ b64dec() {
 # parse_err — последняя ошибка разбора (для сообщения пользователю)
 parse_err() { grep -v 'base64' "$RUN/parse.err" 2>/dev/null | head -c 200 | tr '\n' ' '; }
 
+# формат_body FILE -> json|links — по первому значащему символу
+body_format() {
+	case "$(head -c 400 "$1" | tr -d ' \t\r\n' | head -c 1)" in
+		'[' | '{') echo json ;;
+		*)        echo links ;;
+	esac
+}
+
 # body_to_tsv FILE  -> TSV (ключ \t json) на stdout
 body_to_tsv() {
-	local first
+	local fmt
 	: > "$RUN/parse.err"
 	if [ ! -s "$LIB/parse.jq" ]; then
 		echo "нет файла $LIB/parse.jq (переустановите приложение)" >> "$RUN/parse.err"; return 1
 	fi
-	first="$(head -c 400 "$1" | tr -d ' \t\r\n' | head -c 1)"
-	if [ "$first" = "[" ] || [ "$first" = "{" ]; then
+	fmt="$(body_format "$1")"
+	if [ "$fmt" = json ]; then
 		jq -n -r --arg mode json -f "$LIB/parse.jq" < "$1" 2>>"$RUN/parse.err"
 		return
 	fi
 	if grep -q '://' "$1"; then
 		jq -R -n -r --arg mode links -f "$LIB/parse.jq" < "$1" 2>>"$RUN/parse.err"
-	else
-		b64dec < "$1" > "$1.dec"
-		jq -R -n -r --arg mode links -f "$LIB/parse.jq" < "$1.dec" 2>>"$RUN/parse.err"
-		rm -f "$1.dec"
+		return
 	fi
+	# base64: внутри может быть и список ссылок, и JSON-конфиг Xray —
+	# формат определяем уже по РАСШИФРОВАННОМУ тексту, иначе такой подписки
+	# не распознать и пользователь получит «серверов не найдено».
+	b64dec < "$1" > "$1.dec"
+	fmt="$(body_format "$1.dec")"
+	if [ "$fmt" = json ]; then
+		jq -n -r --arg mode json -f "$LIB/parse.jq" < "$1.dec" 2>>"$RUN/parse.err"
+	else
+		jq -R -n -r --arg mode links -f "$LIB/parse.jq" < "$1.dec" 2>>"$RUN/parse.err"
+	fi
+	rm -f "$1.dec"
 }
 
 # ingest SOURCE_ID < TSV  -> $RUN/new.jsonl, печатает количество
@@ -325,10 +341,13 @@ ingest() {
 
 merge_servers() { # merge_servers SRC MODE(replace|append)  — удалённые пользователем серверы не возвращаются
 	local flt='map(select(.id as $i | ($hid | map(.id) | index($i)) | not))'
+	# Дедупликация БЕЗ сортировки: unique_by() переставлял бы весь список,
+	# потому что id — это md5, и сервера «прыгали» бы при каждом обновлении.
+	local ud='def ud: reduce .[] as $x ([]; if any(.[]; .id == $x.id) then . else . + [$x] end); '
 	if [ "$2" = "replace" ]; then
-		jq -c -s --arg src "$1" --slurpfile h "$HIDDEN" '($h[0] // []) as $hid | ((.[0] | map(select(.source != $src))) + (.[1:] | unique_by(.id))) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
+		jq -c -s --arg src "$1" --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] | map(select(.source != $src))) + (.[1:] | ud)) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
 	else
-		jq -c -s --slurpfile h "$HIDDEN" '($h[0] // []) as $hid | (.[0] + .[1:]) | unique_by(.id) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
+		jq -c -s --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] + .[1:]) | ud) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
 	fi | write_atomic "$SERVERS"
 }
 
@@ -416,8 +435,13 @@ unwrap_link() {
 cmd_add() {
 	local text res
 	text="$(printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-	case "$text" in *"
-"*) ;; *) text="$(unwrap_link "$text")" ;; esac
+	# Ссылку-«обёртку» распаковываем только если вставлена ровно одна строка.
+	# Проверяем через wc, а не шаблон case с переводом строки: результат command
+	# substitution всегда обрезает хвостовые переводы строк, и такой шаблон
+	# превратился бы в пустой — то есть совпал бы с любой строкой.
+	if [ "$(printf '%s\n' "$text" | wc -l)" -eq 1 ]; then
+		text="$(unwrap_link "$text")"
+	fi
 	[ -n "$text" ] || { json_err "Вставьте ссылку"; return 1; }
 	if printf '%s' "$text" | grep -qE '^https?://[^[:space:]]+$'; then
 		res="$(add_sub "$text")"
@@ -633,10 +657,14 @@ selective_lists() {
 		def is_ip: (split("/")[0]) as $a
 			| ((($a | split(".")) | length) == 4 and (($a | split(".")) | all(isdigits)))
 			  or ($a | contains(":"));
+		def is_ip4: (split("/")[0]) as $a
+			| ((($a | split(".")) | length) == 4 and (($a | split(".")) | all(isdigits)));
 		( $keys[] as $k | (presets[$k].domains // [])[] | "D " + . ),
-		( $keys[] as $k | (presets[$k].cidrs // [])[] | "C " + . ),
+		( $keys[] as $k | (presets[$k].cidrs // [])[] | select(is_ip4) | "C " + . ),
+		# Набор vpn4 объявлен как ipv4_addr, поэтому IPv6-подсети в него попасть не могут.
+		# Раньше такая строка ломала nft add element целиком и отключала ВСЕ подсети разом.
 		( $pd[] | ltrimstr("*.") | select(contains("*") | not)
-			| if is_ip then "C " + . else "D " + . end )
+			| if is_ip4 then "C " + . elif is_ip then empty else "D " + . end )
 	' 2>/dev/null
 }
 
@@ -655,6 +683,8 @@ selective_nft_conf() {
 			*)  rule="ip daddr @$SEL_SET meta mark set $SEL_MARK" ;;
 		esac
 	echo "table inet vless {"
+	# Набор живёт до перезапуска службы: dnsmasq добавляет элементы без таймаута,
+	# поэтому старые адреса сами не исчезают — зато переподключение всегда чистит набор.
 	echo "  set $SEL_SET { type ipv4_addr; flags interval, timeout; auto-merge; }"
 	echo "  chain pre { type filter hook prerouting priority -150; policy accept;"
 	[ -n "$rule" ] && echo "    $rule"
@@ -678,7 +708,15 @@ selective_up() {
 		return 1
 	fi
 	c="$(printf '%s\n' "$lines" | awk '$1=="C"{s = s (s ? "," : "") $2} END{print s}')"
-	[ -n "$c" ] && nft add element inet vless "$SEL_SET" "{ $c }" 2>/dev/null
+	if [ -n "$c" ]; then
+		# nft откатывает add element целиком, если хотя бы один элемент негодный.
+		# Поэтому сначала пробуем всё сразу, а при отказе — по одному, чтобы потеря
+		# одной кривой подсети не отключала все остальные.
+		nft add element inet vless "$SEL_SET" "{ $c }" 2>/dev/null ||
+			printf '%s\n' "$c" | tr ',' '\n' | while read -r one; do
+				[ -n "$one" ] && nft add element inet vless "$SEL_SET" "{ $one }" 2>/dev/null
+			done
+	fi
 	return 0
 }
 
@@ -731,6 +769,15 @@ net_up() {
 		[ -n "$dev" ] && devs="$devs $dev"
 	done
 	for net in $subnets; do ip rule add to "$net" lookup main pref 9020; done
+
+	# Если ни один интерфейс не разрешился, то ни одного ip rule не будет: трафик уйдёт мимо
+	# туннеля, а блокировка IPv6 (цикл ниже по $devs) не применится. Молчать здесь нельзя —
+	# снаружи это выглядит как «подключилось, а VPN не работает».
+	if [ -z "$subnets" ]; then
+		logger -t vless "не удалось получить адреса интерфейсов: $ifs" 2>/dev/null
+		net_fail "Не найдены адреса интерфейсов ($ifs). Проверьте «Интерфейсы» в настройках — обычно это lan."
+	fi
+	[ -n "$devs" ] || logger -t vless "не найден l3_device интерфейсов ($ifs) — IPv6 может утекать мимо VPN" 2>/dev/null
 
 	# VPN-серверы подписки — мимо туннеля (VPN-клиенты на телефонах и компьютерах в сети)
 	if cfgb bypass_vpn 1 && [ -s "$RUN/vpn_targets" ]; then
