@@ -27,7 +27,7 @@ if [ "$PM" = apk ]; then
 	for p in $DEPS; do apk info -e "$p" >/dev/null 2>&1 || apk add "$p" || warn "Не удалось установить $p"; done
 else
 	opkg update >/dev/null 2>&1
-	for p in $DEPS; do opkg list-installed 2>/dev/null | grep -q "^$p " || opkg install "$p" || warn "Не удалось установить $p"; done
+	for p in $DEPS; do opkg list-installed "$p" 2>/dev/null | grep -q "^$p " || opkg install "$p" || warn "Не удалось установить $p"; done
 fi
 
 command -v sing-box >/dev/null 2>&1 || { echo "sing-box не установлен — без него VPN не заработает. Освободите место и повторите."; exit 1; }

@@ -27,7 +27,12 @@ rm -rf /usr/share/vless /www/luci-static/resources/view/vless /var/run/vless
 
 if [ "$PURGE" = "--purge" ]; then
 	# Здесь лежат UUID, пароли и токены подписок. Без --purge они остаются.
-	rm -rf /etc/vless
+	# Не удаляем, если это symlink/mount — удалим только содержимое
+	if [ -L /etc/vless ] || mountpoint -q /etc/vless 2>/dev/null; then
+		rm -f /etc/vless/* /etc/vless/.* 2>/dev/null || true
+	else
+		rm -rf /etc/vless
+	fi
 	say "База серверов и подписок удалена (/etc/vless)."
 else
 	say "Серверы и подписки сохранены в /etc/vless (удалить: sh uninstall.sh --purge)."

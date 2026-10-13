@@ -543,6 +543,9 @@ cmd_refresh() { # refresh [ID]
 	else
 		ids="$(jq -r '.[]|select(.kind=="sub")|.id' "$SOURCES")"
 	fi
+	# for, а не printf | while: конвейер выполняет цикл в подоболочке, и счётчики ok/fail
+	# терялись бы (refresh всегда сообщал 0 обновлённых и ok:true даже при ошибках).
+	# id — md5 без пробелов, поэтому разбиение по словам безопасно.
 	for id in $ids; do
 		url="$(jq -r --arg id "$id" '.[]|select(.id==$id and .kind=="sub")|.url' "$SOURCES")"
 		[ -n "$url" ] || continue
@@ -772,10 +775,13 @@ dnsmasq_dir() {
 	# У секции без имени cfg пуст, поэтому каталог называется просто /tmp/dnsmasq.d:
 	# его не покрывает шаблон /tmp/dnsmasq.*.d (там обязателен непустой средний сегмент),
 	# и не покрывает имя секции вида @dnsmasq[0].
-	local name d
-	name="$(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^=]*\)=dnsmasq$/\1/p' | head -n1)"
-	d="/tmp/dnsmasq${name:+.$name}.d"
-	[ -d "$d" ] && { echo "$d"; return 0; }
+	# Если несколько секций dnsmasq — берём первую, у которой есть каталог.
+	local name d names
+	names="$(uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^=]*\)=dnsmasq$/\1/p')"
+	for name in $names; do
+		d="/tmp/dnsmasq${name:+.$name}.d"
+		[ -d "$d" ] && { echo "$d"; return 0; }
+	done
 	[ -d /tmp/dnsmasq.d ] && { echo /tmp/dnsmasq.d; return 0; }
 	# секцию могли переименовать — берём любой существующий каталог dnsmasq
 	for d in /tmp/dnsmasq*.d; do
@@ -847,7 +853,7 @@ selective_nft_conf() {
 # selective_up — включить выборочный режим; при неудаче возвращает 1 (тогда работает обычный режим)
 selective_up() {
 	local lines c
-	if ! dnsmasq --version 2>/dev/null | tr " " "\n" | grep -qx nftset; then
+	if ! dnsmasq --version 2>/dev/null | tr " \t" "\n" | grep -qx nftset; then
 		logger -t vless "dnsmasq собран без nftset: выборочный режим недоступен, используется обычный (установите dnsmasq-full)" 2>/dev/null
 		return 1
 	fi
@@ -903,7 +909,8 @@ net_up() {
 	selective_down
 	ip link set "$TUN" up
 	# ответы приходят из туннеля с чужими адресами — строгий rp_filter их бы отбросил
-	sysctl -qw "net.ipv4.conf.$TUN.rp_filter=2" 2>/dev/null
+	# на некоторых ядрах/контейнерах запись может не разрешаться — игнорируем ошибку
+	sysctl -qw "net.ipv4.conf.$TUN.rp_filter=2" >/dev/null 2>&1 || true
 	ip route replace default dev "$TUN" table $TABLE metric 100 || net_fail "Не удалось создать маршрут через $TUN (пакет ip-full установлен?)"
 	kill_switch_on && ip route replace blackhole default table $TABLE metric 4096
 
@@ -1005,9 +1012,15 @@ net_up() {
 }
 
 net_down() {
-	local d f i=0
+	local d f i=0 p
 	# Дождаться, пока net_up закончит: иначе он добавит правила уже после их удаления.
 	while net_up_running && [ $i -lt 45 ]; do sleep 1; i=$((i + 1)); done
+	# Если net_up завис — убиваем принудительно, иначе stop висит вечно
+	p="$(cat "$RUN/net_up.pid" 2>/dev/null)"
+	if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+		kill -KILL "$p" 2>/dev/null
+		logger -t vless "net_up завис (pid $p), убит принудительно" 2>/dev/null
+	fi
 	rm -f "$RUN/net_up.pid"
 	del_rules; del_rules -6
 	ip route flush table $TABLE 2>/dev/null
@@ -1045,7 +1058,8 @@ ip_lookup() { # через локальный proxy sing-box
 cmd_check() {
 	local r d ipj
 	is_ready || { jq -n -c '{ok:false,error:"VPN не запущен"}'; return 0; }
-	r="$(T=9 api GET '/proxies/proxy/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=7000')"
+	# T должен быть больше timeout в URL (7с), иначе curl обрубит запрос раньше sing-box
+	r="$(T=12 api GET '/proxies/proxy/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=7000')"
 	d="$(printf '%s\n' "$r" | jq -r '.delay // empty' 2>/dev/null)"
 	if [ -z "$d" ]; then
 		jq -n -c --arg m "$(printf '%s\n' "$r" | jq -r '.message // "нет ответа"' 2>/dev/null)" '{ok:false,error:("Сервер не отвечает: "+$m)}'
@@ -1122,12 +1136,15 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 # curl печатает %{time_connect} даже при неудаче, поэтому код возврата проверяется явно:
 # иначе недоступный сервер получал бы правдоподобный «пинг».
 ping_one_direct() { # ping_one_direct HOST PORT -> мс или ""
-	local host="$1" port="$2" t url
+	local host="$1" port="$2" t url code
 	case "$port" in
 		80) url="http://$host" ;;
 		*)  url="https://$host:$port" ;;
 	esac
-	t="$(curl -so /dev/null -m 6 -w '%{time_connect}' "$url" 2>/dev/null)" || t=""
+	# curl возвращает time_connect даже при 4xx/5xx, поэтому проверяем HTTP код
+	t="$(curl -so /dev/null -m 6 -w '%{http_code} %{time_connect}' "$url" 2>/dev/null)" || t=""
+	code="${t%% *}"; t="${t#* }"
+	case "$code" in 2[0-9][0-9]|3[0-9][0-9]) ;; *) t="";; esac
 	if [ -n "$t" ] && printf '%s' "$t" | grep -qE '^[0-9]+\.[0-9]+$'; then
 		awk -v t="$t" 'BEGIN{printf "%d", t*1000}'
 	fi
@@ -1273,6 +1290,10 @@ cmd_selftest() {
 		*server_port*) echo "разбор тестовой ссылки: ok" ;;
 		*) echo "разбор тестовой ссылки: ОШИБКА: $n" ;;
 	esac
+	# Проверка версии jq (walk нужен в build.jq clean)
+	jq --version 2>/dev/null | awk -F- '{print $2}' | awk -F. '{if ($1<1 || ($1==1 && $2<6)) print "ПРЕДУПРЕЖЕНИЕ: jq " $0 " — walk() может не работать, обновите jq"}'
+	# Быстрая проверка доступности интернета (через gstatic)
+	curl -s -m 3 "https://www.gstatic.com/generate_204" >/dev/null 2>&1 && echo "интернет: ok" || echo "интернет: НЕДОСТУПЕН (проверьте WAN)"
 }
 
 # ---------------------------------------------------------------- точка входа

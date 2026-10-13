@@ -2,15 +2,17 @@
 # rpcd-плагин: мост между веб-интерфейсом LuCI и /usr/bin/vless
 
 VLESS="${VLESS_BIN:-/usr/bin/vless}"
+RUN="${VLESS_RUN:-/var/run/vless}"
 
-# run КОМАНДА [АРГУМЕНТЫ…] — вызвать бэкенд; если он ничего не вернул или вернул не JSON,
-# отдаём интерфейсу понятную ошибку вместо пустого ответа
+# run КОМАНДА [АРГУМЕНТЫ…] — вызвать бэкенд; stderr логируется в $RUN/rpcd.err
 run() {
 	local out
-	out="$("$VLESS" "$@" 2>/dev/null)"
+	out="$("$VLESS" "$@" 2>"$RUN/rpcd.err")"
 	if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
 		printf '%s\n' "$out"
 	else
+		# Логируем stderr бэкенда для диагностики
+		[ -s "$RUN/rpcd.err" ] && logger -t vless "rpcd $1: $(head -c 200 "$RUN/rpcd.err")" 2>/dev/null
 		printf '{"ok":false,"error":"Бэкенд не ответил (команда %s). Выполните на роутере: vless selftest"}\n' "$1"
 	fi
 }
@@ -52,14 +54,15 @@ JSON
 				# Текст со ссылками идёт через stdin, а не через аргумент командной строки:
 				# argv виден всем локальным пользователям в /proc/*/cmdline, а там —
 				# полные ключи vless и токены подписок.
-				out="$(printf '%s' "$IN" | jq -j '.text // empty' 2>/dev/null | "$VLESS" add 2>/dev/null)"
+				out="$(printf '%s' "$IN" | jq -j '.text // empty' 2>/dev/null | "$VLESS" add 2>"$RUN/rpcd.err")"
 				if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
 					printf '%s\n' "$out"
 				else
+					[ -s "$RUN/rpcd.err" ] && logger -t vless "rpcd add: $(head -c 200 "$RUN/rpcd.err")" 2>/dev/null
 					printf '{"ok":false,"error":"Не удалось добавить серверы"}\n'
 				fi ;;
 			set)
-				out="$(printf '%s' "$IN" | jq -c '.settings // {}' | "$VLESS" set 2>/dev/null)"
+				out="$(printf '%s' "$IN" | jq -c '.settings // {}' | "$VLESS" set 2>"$RUN/rpcd.err")"
 				if [ -n "$out" ]; then printf '%s\n' "$out"; else echo '{"ok":false,"error":"Не удалось сохранить настройки"}'; fi ;;
 			*)
 				echo '{"ok":false,"error":"unknown method"}' ;;
