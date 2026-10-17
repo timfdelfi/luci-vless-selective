@@ -167,7 +167,7 @@ def vmess($line):
   | ($j.net // "tcp") as $net
   | (if ($j.tls // "") == "tls" then "tls" else "none" end) as $sec
   | { sni: $j.sni, host: $j.host, alpn: $j.alpn, fp: $j.fp, allowInsecure: (if ($j.allowInsecure | truthy) then "1" else null end) } as $q
-  | transport($net; ($j.host | nonempty); ($j.path | nonempty); ($j.path | nonempty); ($j.type | nonempty)) as $tr
+  | transport($net; ($j.host | nonempty); ($j.path | nonempty); (($j.serviceName | nonempty) // ($j.path | nonempty)); ($j.type | nonempty)) as $tr
   | mk("vmess"; ($j.ps // ""); $j.add; ($j.port | tonumber); $net; $sec; {
       type: "vmess", server: $j.add, server_port: ($j.port | tonumber), uuid: $j.id,
       security: ($j.scy // "auto"), alter_id: (($j.aid // 0) | tonumber),

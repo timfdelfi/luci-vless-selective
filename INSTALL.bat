@@ -10,8 +10,11 @@ if "%IP%"=="" set "IP=192.168.1.1"
 echo.
 echo  Дальше роутер дважды спросит пароль root (при вводе символы не видны - это нормально).
 echo.
-tar -czf "%TEMP%\vless-vpn.tar.gz" -C "%~dp0." .
-if errorlevel 1 goto fail
+pushd "%~dp0"
+tar -czf "%TEMP%\vless-vpn.tar.gz" .
+set "RC=%errorlevel%"
+popd
+if not "%RC%"=="0" goto fail
 scp -O -o StrictHostKeyChecking=accept-new "%TEMP%\vless-vpn.tar.gz" root@%IP%:/tmp/vless-vpn.tar.gz
 if errorlevel 1 goto fail
 ssh root@%IP% "rm -rf /tmp/vless-vpn && mkdir -p /tmp/vless-vpn && tar xzf /tmp/vless-vpn.tar.gz -C /tmp/vless-vpn && find /tmp/vless-vpn -type f -exec sed -i 's/\r$//' {} + && sh /tmp/vless-vpn/install.sh"

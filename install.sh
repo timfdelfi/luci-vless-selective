@@ -21,7 +21,7 @@ free_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
 [ -n "$free_kb" ] && [ "$free_kb" -lt 20000 ] && warn "Свободного места мало (${free_kb} КБ). sing-box занимает около 15–20 МБ."
 
 say "Устанавливаю зависимости ($PM)"
-DEPS="sing-box kmod-tun curl jq ca-bundle ip-full"
+DEPS="sing-box kmod-tun curl jq ca-bundle ip-full nftables"
 if [ "$PM" = apk ]; then
 	apk update >/dev/null 2>&1
 	for p in $DEPS; do apk info -e "$p" >/dev/null 2>&1 || apk add "$p" || warn "Не удалось установить $p"; done
@@ -39,12 +39,35 @@ fi
 
 say "Копирую файлы"
 [ -f /etc/config/vless ] && cp /etc/config/vless /tmp/vless.config.keep
+
+# Копию прежней установки держим до конца: если копирование оборвётся, вернём её,
+# а не оставим человека без работающего приложения.
+BK=/tmp/vless.prev.tar.gz
+rm -f "$BK"
+old_files=""
+# Списки файлов пакета читаем из временных файлов (без раскрытия $(...) в цикле).
+(cd root && find . -type f) | sed 's#^\./##' > /tmp/vless.files.root
+(cd htdocs && find . -type f) | sed 's#^\./##' > /tmp/vless.files.www
+while IFS= read -r f; do
+	[ -n "$f" ] && [ -e "/$f" ] && old_files="$old_files $f"
+done < /tmp/vless.files.root
+while IFS= read -r f; do
+	[ -n "$f" ] && [ -e "/www/$f" ] && old_files="$old_files www/$f"
+done < /tmp/vless.files.www
+rm -f /tmp/vless.files.root /tmp/vless.files.www
+if [ -n "$old_files" ]; then
+	# shellcheck disable=SC2086
+	tar czf "$BK" -C / $old_files 2>/dev/null || rm -f "$BK"
+fi
+
 # Старый процесс держит /usr/bin/vless: без остановки копирование может пройти,
 # а запущенный экземпляр останется старой версии до перезагрузки.
-is_running_vless && /etc/init.d/vless stop >/dev/null 2>&1
+was_running=0
+is_running_vless && { was_running=1; /etc/init.d/vless stop >/dev/null 2>&1; }
+
 cp -a root/. /
 cp -a htdocs/. /www/
-[ -f /tmp/vless.config.keep ] && { cp /tmp/vless.config.keep /etc/config/vless; rm -f /tmp/vless.config.keep; }
+[ -f /tmp/vless.config.keep ] && cp /tmp/vless.config.keep /etc/config/vless
 chmod 0755 /usr/bin/vless /usr/libexec/rpcd/vless /etc/init.d/vless /etc/uci-defaults/90-vless
 
 # Копирование может оборваться на середине (нет места, обрыв ssh). Тогда пакет
@@ -57,10 +80,19 @@ for f in /usr/bin/vless /usr/libexec/rpcd/vless /etc/init.d/vless \
 done
 if [ -n "$missing" ]; then
 	echo "Копирование файлов не завершилось, отсутствуют:$missing"
+	if [ -s "$BK" ] && tar xzf "$BK" -C / 2>/dev/null; then
+		echo "Прежняя версия восстановлена."
+		[ "$was_running" = 1 ] && /etc/init.d/vless start >/dev/null 2>&1
+	else
+		# Свежая установка: оставлять половину файлов нельзя.
+		sh uninstall.sh >/dev/null 2>&1
+		[ -f /tmp/vless.config.keep ] && { mkdir -p /etc/config; cp /tmp/vless.config.keep /etc/config/vless; }
+	fi
 	echo "Установка прервана. Проверьте свободное место и повторите."
-	sh uninstall.sh >/dev/null 2>&1
 	exit 1
 fi
+rm -f "$BK" /tmp/vless.config.keep
+
 [ -x /usr/bin/vless ] || { echo "Скрипт не исполняемый — проверка прав не пройдена."; exit 1; }
 
 say "Применяю настройки"
@@ -70,6 +102,15 @@ say "Применяю настройки"
 rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache 2>/dev/null
 
 pgrep -x sing-box >/dev/null 2>&1 && warn "Уже запущен другой sing-box (возможно, Podkop). Перед подключением остановите его — два VPN одновременно мешают друг другу."
+
+# Выборочная маршрутизация работает только с dnsmasq, собранным с nftset (dnsmasq-full).
+if command -v dnsmasq >/dev/null 2>&1; then
+	dnsmasq --version 2>/dev/null | tr ' \t' '\n\n' | grep -qx 'nftset' \
+		|| warn "dnsmasq собран без nftset: режим «только выбранные сервисы» работать не будет. Установите dnsmasq-full."
+fi
+
+# Обновление остановило работающий VPN — возвращаем его, а не оставляем выключенным.
+[ "$was_running" = 1 ] && { say "Запускаю VPN снова"; /etc/init.d/vless start >/dev/null 2>&1; }
 
 say "Самопроверка"
 /usr/bin/vless selftest

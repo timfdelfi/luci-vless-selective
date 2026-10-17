@@ -79,6 +79,36 @@ valid_cidr 10.0.0.1/ && bad "valid_cidr: пустая маска отклоне�
 [ "$(cron_spec 72)" = "17 4 */3 * *" ] && ok "cron: раз в 3 дня" || bad "cron: раз в 3 дня"
 [ "$(cron_spec 168)" = "17 4 */7 * *" ] && ok "cron: раз в неделю" || bad "cron: раз в неделю"
 
+echo "== прямой пинг (ping_one_direct)"
+eval "$(sed -n '/^ping_one_direct()/,/^}/p' root/usr/bin/vless)"
+pdir="$(mktemp -d)"
+# Заглушка curl: поведение задаётся переменными FAKE_OUT и FAKE_RC (вывод -w и код выхода).
+cat > "$pdir/curl" <<'FAKE'
+#!/bin/sh
+printf '%s' "$FAKE_OUT"
+exit "${FAKE_RC:-0}"
+FAKE
+chmod +x "$pdir/curl"
+pp() { ( PATH="$pdir:$PATH"; FAKE_OUT="$1"; FAKE_RC="$2"; export FAKE_OUT FAKE_RC; ping_one_direct "${3:-example.com}" "${4:-443}" ); }
+[ "$(pp '404 0.045000 0.120000' 0)" = "45" ]   && ok "пинг: ответ 404 (маскировка Reality) — сервер жив" || bad "пинг: ответ 404 (маскировка Reality)"
+[ "$(pp '000 0.050000 0.130000' 52)" = "50" ]  && ok "пинг: пустой ответ после TLS (curl 52) — сервер жив" || bad "пинг: пустой ответ после TLS (curl 52)"
+[ "$(pp '000 0.050000 0.130000' 56)" = "50" ]  && ok "пинг: обрыв после TLS (curl 56) — сервер жив" || bad "пинг: обрыв после TLS (curl 56)"
+[ -z "$(pp '000 0.050000 0.000000' 35)" ]      && ok "пинг: сброс до конца TLS (DPI) — недоступен" || bad "пинг: сброс до конца TLS (DPI)"
+[ -z "$(pp '000 0.000000 0.000000' 28)" ]      && ok "пинг: нет TCP connect — недоступен" || bad "пинг: нет TCP connect"
+[ -z "$(pp '000 0.040000 0.000000' 52 example.com 80)" ] && ok "пинг: порт 80 без HTTP-ответа — недоступен" || bad "пинг: порт 80 без HTTP-ответа"
+[ "$(pp '200 0.012000 0.000000' 0 example.com 80)" = "12" ] && ok "пинг: порт 80, ответ 200" || bad "пинг: порт 80, ответ 200"
+[ -z "$(pp '' 7)" ]                            && ok "пинг: curl ничего не вывел — недоступен" || bad "пинг: curl ничего не вывел"
+# IPv6-адрес должен попасть в URL в квадратных скобках
+cat > "$pdir/curl" <<'FAKE'
+#!/bin/sh
+for a in "$@"; do last="$a"; done
+printf '%s' "$last" > "$FAKE_URLFILE"
+printf '200 0.010000 0.020000'
+FAKE
+( PATH="$pdir:$PATH"; FAKE_URLFILE="$pdir/url"; export FAKE_URLFILE; ping_one_direct 2001:db8::1 8443 >/dev/null )
+[ "$(cat "$pdir/url")" = "https://[2001:db8::1]:8443" ] && ok "пинг: IPv6 в URL в скобках" || bad "пинг: IPv6 в URL в скобках"
+rm -rf "$pdir"
+
 rm -rf "$tmp"
 
 echo

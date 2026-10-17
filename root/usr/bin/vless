@@ -735,6 +735,14 @@ rotate_log() { # если лог больше 5 МБ — обрезаем, ос�
 cmd_run() {
 	rm -f "$RUN/up_since" "$RUN/ip.json"
 	rotate_log
+	# Если предыдущий net_up ещё работает от прошлого запуска — убиваем его
+	local old_p; old_p="$(cat "$RUN/net_up.pid" 2>/dev/null)"
+	# pid из файла мог устареть (ранний выход net_up его не стирает) и достаться чужому
+	# процессу — убиваем, только если это действительно наш скрипт и не мы сами.
+	if [ -n "$old_p" ] && [ "$old_p" != "$$" ] && kill -0 "$old_p" 2>/dev/null \
+		&& tr '\0' ' ' < "/proc/$old_p/cmdline" 2>/dev/null | grep -q 'vless'; then
+		kill -9 "$old_p" 2>/dev/null
+	fi
 	# net_up ждёт появления туннеля до 40 с, поэтому его pid запоминаем: иначе
 	# «Отключить» в этот момент удалял бы ещё не созданные правила, а net_up затем
 	# добавил бы их после остановки службы, уведя трафик в мёртвый туннель.
@@ -1135,19 +1143,36 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 # Меряет время установления TCP-соединения до server:port — хороший прокси для «как далеко сервер».
 # curl печатает %{time_connect} даже при неудаче, поэтому код возврата проверяется явно:
 # иначе недоступный сервер получал бы правдоподобный «пинг».
-ping_one_direct() { # ping_one_direct HOST PORT -> мс или ""
-	local host="$1" port="$2" t url code
+ping_one_direct() { # ping_one_direct HOST PORT -> мс (время TCP connect) или ""
+	local host="$1" port="$2" out rc code tc ta u url
+	# IPv6-адрес в URL должен быть в квадратных скобках
+	u="$host"
+	case "$host" in *:*) u="[$host]" ;; esac
 	case "$port" in
-		80) url="http://$host" ;;
-		*)  url="https://$host:$port" ;;
+		80) url="http://$u" ;;
+		*)  url="https://$u:$port" ;;
 	esac
-	# curl возвращает time_connect даже при 4xx/5xx, поэтому проверяем HTTP код
-	t="$(curl -so /dev/null -m 6 -w '%{http_code} %{time_connect}' "$url" 2>/dev/null)" || t=""
-	code="${t%% *}"; t="${t#* }"
-	case "$code" in 2[0-9][0-9]|3[0-9][0-9]) ;; *) t="";; esac
-	if [ -n "$t" ] && printf '%s' "$t" | grep -qE '^[0-9]+\.[0-9]+$'; then
-		awk -v t="$t" 'BEGIN{printf "%d", t*1000}'
-	fi
+	# -k: у Reality отдаётся сертификат сайта-маскировки, он не совпадает с адресом сервера.
+	# Код выхода curl не отбрасывает результат: сервер VLESS/Trojan без fallback закрывает
+	# соединение на HTTP-запрос (curl 52/56), хотя TCP и TLS уже прошли — он живой.
+	# Недоступным считаем сервер, у которого не было TCP connect, а для https — и тот,
+	# что сбросил соединение ещё до конца TLS-рукопожатия (так выглядит блокировка DPI).
+	out="$(curl -k -so /dev/null -m 6 -w '%{http_code} %{time_connect} %{time_appconnect}' "$url" 2>/dev/null)"; rc=$?
+	set -- $out
+	code="$1"; tc="$2"; ta="$3"
+	printf '%s' "$tc" | grep -qE '^[0-9]+\.[0-9]+$' || return 0
+	awk -v t="$tc" 'BEGIN{exit !(t>0)}' || return 0
+	case "$code" in
+		[1-5][0-9][0-9]) ;;
+		*)
+			# ответа нет: годится только «закрыл после рукопожатия» (52/56) на https
+			[ "$port" != 80 ] || return 0
+			case "$rc" in 52|56) ;; *) return 0 ;; esac
+			printf '%s' "$ta" | grep -qE '^[0-9]+\.[0-9]+$' || return 0
+			awk -v t="$ta" 'BEGIN{exit !(t>0)}' || return 0
+			;;
+	esac
+	awk -v t="$tc" 'BEGIN{printf "%d", t*1000}'
 }
 
 cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
@@ -1233,7 +1258,7 @@ cmd_status() {
 cmd_state() {
 	local delays='{}'
 	# Битый delays.json не должен ломать весь ответ интерфейса.
-	[ -s "$RUN/delays.json" ] && printf '%s' "$delays" | jq -e . >/dev/null 2>&1 && delays="$(cat "$RUN/delays.json")"
+	[ -s "$RUN/delays.json" ] && jq -e 'type=="object"' "$RUN/delays.json" >/dev/null 2>&1 && delays="$(cat "$RUN/delays.json")"
 	# URL подписки содержит токен доступа. Метод state доступен на чтение любому
 	# пользователю LuCI с доступом к приложению, поэтому наружу отдаём только хост:
 	# интерфейс всё равно URL не показывает, а ключи всех подписок хранятся в пути.

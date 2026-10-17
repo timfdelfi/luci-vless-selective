@@ -29,7 +29,7 @@ if [ "$PURGE" = "--purge" ]; then
 	# Здесь лежат UUID, пароли и токены подписок. Без --purge они остаются.
 	# Не удаляем, если это symlink/mount — удалим только содержимое
 	if [ -L /etc/vless ] || mountpoint -q /etc/vless 2>/dev/null; then
-		rm -f /etc/vless/* /etc/vless/.* 2>/dev/null || true
+		find /etc/vless/ -mindepth 1 -delete 2>/dev/null || true
 	else
 		rm -rf /etc/vless
 	fi
@@ -38,6 +38,12 @@ else
 	say "Серверы и подписки сохранены в /etc/vless (удалить: sh uninstall.sh --purge)."
 fi
 
+# Остатки DNS-настройки: без них dnsmasq продолжил бы спрашивать несуществующий 127.0.0.77.
+stale=0
+for d in /tmp/dnsmasq*.d; do
+	[ -f "$d/vless.conf" ] && { rm -f "$d/vless.conf"; stale=1; }
+done
+[ "$stale" = 1 ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
 /etc/init.d/rpcd restart >/dev/null 2>&1
 /etc/init.d/firewall reload >/dev/null 2>&1
 /etc/init.d/cron restart >/dev/null 2>&1
