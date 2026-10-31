@@ -8,10 +8,21 @@ ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n' "$1"; fail=1; }
 
 W="$(mktemp -d)"
+mkdir -p "$W/bin"
+cat > "$W/bin/vless" <<EOF
+#!/bin/sh
+exec sh "$ROOT/root/usr/bin/vless" "\$@"
+EOF
+cat > "$W/bin/vless-rpcd" <<EOF
+#!/bin/sh
+exec sh "$ROOT/root/usr/libexec/rpcd/vless" "\$@"
+EOF
+chmod +x "$W/bin/vless" "$W/bin/vless-rpcd"
 export VLESS_DIR="$W/etc" VLESS_RUN="$W/run" VLESS_LIB="$ROOT/root/usr/share/vless" VLESS_PID="$W/vless.pid"
 export VLESS_CRON="$W/crontab" UCI_DB="$W/uci.db" NO_PROXY=127.0.0.1 no_proxy=127.0.0.1
-export PATH="$ROOT/tests/mock:$PATH"
-H="sh $ROOT/root/usr/bin/vless"
+export PATH="$W/bin:$ROOT/tests/mock:$PATH"
+H="vless"
+RP="vless-rpcd"
 j() { printf '%s' "$1" | jq -e "$2" >/dev/null 2>&1; }
 t() { j "$2" "$3" && ok "$1" || { bad "$1"; printf '       получено: %s\n' "$(printf '%s' "$2" | cut -c1-300)"; }; }
 
@@ -46,6 +57,10 @@ r="$(printf '%s' '{"kill_switch":true,"mtu":"abc","remote_dns":"not-ip","direct_
 t "set: ok, но неверные значения перечислены" "$r" '.ok==true and (.ignored|index("mtu")) and (.ignored|index("remote_dns")) and (.ignored|any(startswith("direct_domains"))) and (.ignored|any(startswith("devices")))'
 r="$($H settings)"
 t "set: валидное сохранено, мусор — нет" "$r" '.kill_switch==true and .mtu==1400 and .remote_dns=="1.1.1.1" and .direct_domains==["example.org"] and .devices==["192.168.1.50"] and .presets==["telegram"] and .mode=="include"'
+r="$(printf '%s' '{"direct_domains":["valid.example","999.1.1.1","192.0.2.0/33","bad..example","*.good.example"],"proxy_domains":["2001:db8::/32","2001:db8:::1"]}' | $H set)"
+t "set: IP/CIDR и домены проверяются до сохранения" "$r" '.ok==true and (.ignored|any(startswith("direct_domains: 999.1.1.1"))) and (.ignored|any(startswith("direct_domains: 192.0.2.0/33"))) and (.ignored|any(startswith("direct_domains: bad..example"))) and (.ignored|any(startswith("proxy_domains: 2001:db8:::1")))'
+r="$($H settings)"
+t "set: корректные домены и IPv6 сохраняются" "$r" '.direct_domains==["valid.example","*.good.example"] and .proxy_domains==["2001:db8::/32"]'
 r="$(printf '%s' '{"mtu":1500,"update_interval":6}' | $H set)"
 t "set: числа принимаются" "$r" '.ok==true and (.ignored|length)==0'
 grep -q '^17 \*/6 \* \* \* /usr/bin/vless update-all' "$VLESS_CRON" && ok "cron: запись «каждые 6 часов»" || bad "cron: запись «каждые 6 часов»"
@@ -66,9 +81,31 @@ r="$($H state)"
 t "remove: выбранный удалён → «Авто», осталось 6" "$r" '(.servers|length)==6 and .settings.selected=="auto" and .sources[0].count==6'
 r="$($H remove 'zz zz')"
 t "remove: некорректный id отклонён" "$r" '.ok==false'
+r="$($H remove deadbeef)"
+t "remove: неизвестный id возвращает ошибку, а не успех" "$r" '.ok==false and (.error|contains("не найдены"))'
+
+# Подмена mv однократно срывает сохранение servers.json: команда должна вернуть ошибку
+# и восстановить уже затронутые файлы базы из резервной копии.
+REAL_MV="$(command -v mv)"; export REAL_MV
+cat > "$W/bin/mv" <<'FAKE'
+#!/bin/sh
+if [ "$2" = "$VLESS_FAIL_MV_TARGET" ] && [ ! -e "$VLESS_FAIL_MV_MARKER" ]; then
+	touch "$VLESS_FAIL_MV_MARKER"
+	exit 1
+fi
+exec "$REAL_MV" "$@"
+FAKE
+chmod +x "$W/bin/mv"
+id="$($H state | jq -r '.servers[0].id')"
+r="$(VLESS_FAIL_MV_TARGET="$VLESS_DIR/servers.json" VLESS_FAIL_MV_MARKER="$W/mv.failed" $H remove "$id")"
+t "remove: ошибка записи возвращается клиенту" "$r" '.ok==false and (.error|contains("сохранить список серверов"))'
+t "remove: при сбое записи база восстановлена" "$($H state)" ".servers | any(.id==\"$id\")"
+rm -f "$W/bin/mv"
 
 echo "== подписка (локальный сервер)"
-python3 tests/subserver.py 18765 tests/links.txt & SP=$!
+PYTHON="python3"
+command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1 || PYTHON="python"
+$PYTHON tests/subserver.py 18765 tests/links.txt & SP=$!
 sleep 1
 r="$($H add http://127.0.0.1:18765/sub)"
 t "подписка: добавлена, имя из Profile-Title" "$r" '.ok==true and .kind=="sub" and .name=="Тест" and .added==7'
@@ -170,7 +207,6 @@ printf '%s' "$r" | jq -e '.log | test("предыдущий запуск")' >/de
 	&& ok "журнал показывает прошлый запуск отдельным блоком" || bad "прошлый запуск не виден в журнале"
 
 echo "== rpcd-плагин"
-RP="sh $ROOT/root/usr/libexec/rpcd/vless"
 $RP list | jq -e 'has("connect") and has("set") and has("ping") and has("ping-direct")' >/dev/null && ok "list: валидный JSON с методами" || bad "list"
 # Каждый метод, который вызывает интерфейс, обязан быть в списке rpcd, иначе ubus его не отдаст.
 miss=""
@@ -178,11 +214,11 @@ for m in $(sed -n "s/.*H('\([a-z-]*\)'.*/\1/p" "$ROOT/htdocs/luci-static/resourc
 	$RP list | jq -e --arg m "$m" 'has($m)' >/dev/null 2>&1 || miss="$miss $m"
 done
 [ -z "$miss" ] && ok "все методы интерфейса есть в rpcd list" || bad "в rpcd list нет:$miss"
-$RP list | jq -r 'keys[]' | while read -r m; do
+$RP list | jq -r 'keys[]' | tr -d '\r' | while read -r m; do
 	grep -q "\"$m\"" "$ROOT/root/usr/share/rpcd/acl.d/luci-vless-selective.json" || echo "acl: нет $m"
 done > "$W/acl.miss" 2>/dev/null
 [ -s "$W/acl.miss" ] && bad "методы без прав в ACL: $(tr '\n' ' ' < "$W/acl.miss")" || ok "все методы разрешены в ACL"
-r="$(echo '{}' | VLESS_BIN="$ROOT/root/usr/bin/vless" $RP call status)"
+r="$(echo '{}' | VLESS_BIN="$W/bin/vless" $RP call status)"
 t "call status: проксируется" "$r" 'has("running")'
 r="$(echo '{}' | VLESS_BIN=/nonexistent $RP call state)"
 t "call при сломанном бэкенде: JSON-ошибка, не пустой ответ" "$r" '.ok==false and (.error|length)>5'
@@ -218,3 +254,4 @@ $H state | jq -e '.settings.bypass_ru==true or .settings.bypass_ru==false' >/dev
 rm -rf "$W"
 [ $fail -eq 0 ] && echo "ТЕСТЫ БЭКЕНДА ПРОЙДЕНЫ" || echo "ЕСТЬ ОШИБКИ В БЭКЕНДЕ"
 exit $fail
+о

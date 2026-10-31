@@ -21,7 +21,7 @@ free_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
 [ -n "$free_kb" ] && [ "$free_kb" -lt 20000 ] && warn "Свободного места мало (${free_kb} КБ). sing-box занимает около 15–20 МБ."
 
 say "Устанавливаю зависимости ($PM)"
-DEPS="sing-box kmod-tun curl jq ca-bundle ip-full nftables"
+DEPS="sing-box kmod-tun curl jq ca-bundle ip-full nftables kmod-nft-queue kmod-nfnetlink-queue"
 if [ "$PM" = apk ]; then
 	apk update >/dev/null 2>&1
 	for p in $DEPS; do apk info -e "$p" >/dev/null 2>&1 || apk add "$p" || warn "Не удалось установить $p"; done
@@ -68,12 +68,13 @@ is_running_vless && { was_running=1; /etc/init.d/vless stop >/dev/null 2>&1; }
 cp -a root/. /
 cp -a htdocs/. /www/
 [ -f /tmp/vless.config.keep ] && cp /tmp/vless.config.keep /etc/config/vless
-chmod 0755 /usr/bin/vless /usr/libexec/rpcd/vless /etc/init.d/vless /etc/uci-defaults/90-vless
+chmod 0755 /usr/bin/vless /usr/bin/vless-discord /usr/libexec/rpcd/vless /etc/init.d/vless /etc/init.d/vless-discord /etc/uci-defaults/90-vless
 
 # Копирование может оборваться на середине (нет места, обрыв ssh). Тогда пакет
 # считался бы установленным, а VPN был бы сломан. Проверяем главное и откатываемся.
 missing=""
-for f in /usr/bin/vless /usr/libexec/rpcd/vless /etc/init.d/vless \
+for f in /usr/bin/vless /usr/bin/vless-discord /usr/libexec/rpcd/vless /etc/init.d/vless /etc/init.d/vless-discord \
+	/usr/share/vless/discord-strategies.conf \
 	/usr/share/vless/parse.jq /usr/share/vless/build.jq /usr/share/vless/presets.jq \
 	/usr/share/rpcd/acl.d/luci-vless-selective.json; do
 	[ -s "$f" ] || missing="$missing $f"

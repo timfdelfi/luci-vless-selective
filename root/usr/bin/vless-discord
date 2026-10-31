@@ -1,0 +1,894 @@
+#!/bin/sh
+# vless-discord — обход блокировки Discord через zapret (nfqws) с запасным путём через VPN.
+#
+# Как это работает:
+#   1. Скачивает nfqws (bol-van/zapret) под архитектуру роутера и «фейки» из релиза Flowseal.
+#   2. Заворачивает в nfqws только трафик Discord (по списку доменов; голос — по портам UDP).
+#   3. Перебирает стратегии, пока проверка Discord не пройдёт. Рабочую запоминает.
+#   4. Если не подошла ни одна — в режиме «auto» Discord уходит через VPN (sing-box),
+#      а раз в несколько часов скрипт пробует вернуться на zapret.
+# Все команды печатают JSON, чтобы их мог вызывать веб-интерфейс.
+
+DIR="${VLESS_DIR:-/etc/vless}"
+RUN="${VLESS_RUN:-/var/run/vless}"
+LIB="${VLESS_LIB:-/usr/share/vless}"
+DD="${VLESS_DD:-/etc/vless-discord}"      # без секретов: nfqws работает не от root и должен читать эти файлы
+VLESS_BIN="${VLESS_BIN:-/usr/bin/vless}"
+NFQWS="$DD/bin/nfqws"
+FAKE="$DD/fake"
+LIST="$DD/lists/discord.txt"
+STRATS="$LIB/discord-strategies.conf"        # встроенные запасные стратегии
+STRATS_GEN="$DD/strategies.flowseal.conf"    # собранные из general*.bat релиза Flowseal
+ACTIVE="$RUN/discord.active"              # zapret | vpn | off | error
+STATE="$RUN/discord.json"
+QNUM=217
+FWMARK=0x40000000
+NFT_TABLE=vless_dpi
+RETRY_SECS=21600                          # как часто пробовать вернуться с VPN на zapret
+MIXED_PORT=2080
+GH_ZAPRET="https://api.github.com/repos/bol-van/zapret/releases/latest"
+GH_FLOWSEAL="https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases/latest"
+TCP_PORTS="443, 2053, 2083, 2087, 2096, 8443"
+UDP_PORTS="19294-19344, 50000-50100"
+
+mkdir -p "$RUN" "$DD/bin" "$FAKE" "$DD/lists" 2>/dev/null
+chmod 755 "$DD" "$DD/bin" "$FAKE" "$DD/lists" 2>/dev/null
+
+# ---------------------------------------------------------------- утилиты
+
+cfg() { local v; v="$(uci -q get vless.main."$1" 2>/dev/null)"; [ -n "$v" ] && echo "$v" || echo "$2"; }
+json_err() { jq -n -c --arg e "$1" '{ok:false,error:$e}'; }
+log() { logger -t vless-discord "$*" 2>/dev/null; }
+now() { date +%s; }
+
+# Состояние (json в $RUN) обновляем атомарно.
+state_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE" 2>/dev/null; }
+state_set() { # state_set ключ JSON-значение [ключ значение …]
+	local tmp="$STATE.tmp" cur args="" k v
+	[ -s "$STATE" ] && cur="$(cat "$STATE")" || cur='{}'
+	printf '%s' "$cur" | jq -e 'type=="object"' >/dev/null 2>&1 || cur='{}'
+	while [ $# -ge 2 ]; do
+		k="$1"; v="$2"; shift 2
+		cur="$(printf '%s' "$cur" | jq -c --arg k "$k" --argjson v "$v" '.[$k]=$v')"
+	done
+	printf '%s\n' "$cur" > "$tmp" && mv "$tmp" "$STATE"
+}
+jstr() { jq -n -c --arg s "$1" '$s'; }
+
+active() { cat "$ACTIVE" 2>/dev/null || echo off; }
+
+LOCKDIR="$RUN/discord.lock"
+dlock() {
+	local i=0 p
+	while ! mkdir "$LOCKDIR" 2>/dev/null; do
+		p="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+		if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$LOCKDIR"; continue; fi
+		i=$((i + 1)); [ $i -gt 3 ] && return 1
+		sleep 1
+	done
+	echo $$ > "$LOCKDIR/pid"
+	echo "$1" > "$LOCKDIR/what"
+}
+dunlock() { rm -rf "$LOCKDIR"; }
+busy_what() {
+	local p; p="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+	[ -n "$p" ] && kill -0 "$p" 2>/dev/null && cat "$LOCKDIR/what" 2>/dev/null
+}
+# Долгие операции (установка, перебор стратегий) не должны идти параллельно.
+exclusive() { # exclusive ИМЯ КОМАНДА [АРГУМЕНТЫ…]
+	local what="$1"; shift
+	dlock "$what" || { json_err "Занято: сейчас выполняется «$(busy_what)». Повторите через минуту."; return 1; }
+	trap dunlock EXIT
+	"$@"
+}
+
+# ---------------------------------------------------------------- стратегии
+
+# Сначала стратегии из релиза Flowseal (они же обновляются вместе с ним), потом встроенные.
+all_strats() { cat "$STRATS_GEN" "$STRATS" 2>/dev/null | grep -v '^[[:space:]]*#' | awk -F'|' 'NF>=3'; }
+strategy_ids() { all_strats | awk -F'|' '!seen[$1]++{print $1}'; }
+strategy_line() { all_strats | awk -F'|' -v id="$1" '$1==id{print; exit}'; }
+strategy_name() { strategy_line "$1" | awk -F'|' '{print $2}'; }
+
+# strategy_args ID — строка аргументов nfqws или пустота, если стратегия недоступна
+# (нет .bin-файла) или не существует.
+strategy_args() {
+	local line prof a f
+	line="$(strategy_line "$1")"
+	[ -n "$line" ] || return 1
+	prof="$(printf '%s' "$line" | awk -F'|' '{print $3}' | sed -e "s#@F@#$FAKE#g" -e "s#@L@#$LIST#g")"
+	[ -n "$prof" ] || return 1
+	# каждый файл, на который ссылается стратегия, должен существовать
+	for a in $prof; do
+		case "$a" in
+			*"$FAKE"/*) f="${a#*=}"; [ -s "$f" ] || return 1 ;;
+		esac
+	done
+	printf '%s %s\n' "--qnum=$QNUM --dpi-desync-fwmark=$FWMARK --user=daemon" "$prof"
+}
+
+# bat2profiles ФАЙЛ.bat — профили nfqws для Discord из .bat-файла Flowseal. Берём только то, что
+# относится к Discord (голос по UDP, discord.media по TCP, TLS на 443), пути Windows заменяем
+# на наши, списки Flowseal — на список Discord. Пусто, если ничего подходящего нет.
+bat2profiles() {
+	awk '
+	function trim(x) { sub(/^[ \t]+/, "", x); sub(/[ \t]+$/, "", x); return x }
+	BEGIN { inw = 0; buf = "" }
+	{
+		gsub(/\r/, "")
+		if (!inw) {
+			p = index($0, "winws.exe")
+			if (p == 0) next
+			line = substr($0, p + 9)
+			sub(/^"/, "", line)
+			inw = 1
+		} else {
+			line = trim($0)
+			if (line == "") next
+			if (substr(line, 1, 2) != "--") { inw = 0; next }
+		}
+		sub(/\^[ \t]*$/, "", line)
+		buf = buf " " line
+	}
+	END {
+		n = split(buf, seg, /--new/)
+		out = ""
+		for (i = 1; i <= n; i++) {
+			s = " " trim(seg[i]) " "
+			if (s ~ /GameFilter/ || s ~ /ipset-all/) continue
+			keep = 0; tls = 0
+			if (s ~ /--filter-udp=[^ ]*19294-19344/) keep = 1
+			else if (s ~ /--filter-tcp=[^ ]*2053/ && s ~ /--hostlist-domains=discord\.media/) keep = 1
+			else if (s ~ /--filter-tcp=[^ ]*443/ && s ~ /--hostlist=/) { keep = 1; tls = 1 }
+			if (!keep) continue
+			gsub(/--wf-[a-z-]+=[^ ]*/, "", s)
+			gsub(/--hostlist(-exclude)?=[^ ]+/, "", s)
+			gsub(/--ipset(-exclude)?=[^ ]+/, "", s)
+			gsub(/%BIN%/, "@F@/", s)
+			gsub(/"/, "", s)
+			if (tls) s = s " --hostlist=@L@"
+			s = trim(s); gsub(/[ ]+/, " ", s)
+			out = out (out == "" ? "" : " --new ") s
+		}
+		print out
+	}' "$1"
+}
+
+# build_strategies КАТАЛОГ — собрать $STRATS_GEN из всех general*.bat в каталоге.
+# Порядок: general, ALT, ALT2 … ALTn, остальные; помеченные «NOT RECOMMENDED» — в конце.
+build_strategies() {
+	local raw="$RUN/strategies.raw" f base id key n prof count=0
+	: > "$raw"
+	find "$1" -name 'general*.bat' 2>/dev/null | while IFS= read -r f; do
+		prof="$(bat2profiles "$f")"
+		[ -n "$prof" ] || continue
+		base="$(basename "$f" .bat)"
+		id="f-$(printf '%s' "$base" | tr 'A-Z' 'a-z' | sed -e 's/^general//' -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//')"
+		[ "$id" = f- ] && id=f-general
+		n="$(printf '%s' "$id" | sed -n 's/^f-alt\([0-9][0-9]*\)$/\1/p')"
+		case "$id" in
+			f-general) key=0 ;;
+			f-alt)     key=1 ;;
+			f-alt[0-9]*) key="${n:-50}" ;;
+			*)         key=50 ;;
+		esac
+		grep -qi 'NOT RECOMMENDED' "$f" && key=$((key + 1000))
+		printf '%s|%s|%s|%s\n' "$key" "$id" "$base" "$prof" >> "$raw"
+	done
+	count="$(wc -l < "$raw")"
+	[ "${count:-0}" -gt 0 ] || { rm -f "$raw"; return 1; }
+	sort -t'|' -k1,1n "$raw" | cut -d'|' -f2- > "$STRATS_GEN.tmp" && chmod 644 "$STRATS_GEN.tmp" && mv "$STRATS_GEN.tmp" "$STRATS_GEN"
+	rm -f "$raw"
+	echo "$count"
+}
+
+# usable ID — стратегию можно запускать: файлы на месте и nfqws принимает аргументы
+usable() {
+	local args
+	args="$(strategy_args "$1")" || return 1
+	[ -x "$NFQWS" ] || return 1
+	# shellcheck disable=SC2086
+	"$NFQWS" --dry-run $args >/dev/null 2>&1
+}
+
+current_id() {
+	local id; id="$(cat "$DD/current" 2>/dev/null)"
+	[ -n "$id" ] && [ -n "$(strategy_line "$id")" ] && { echo "$id"; return; }
+	id="$(cat "$DD/chosen" 2>/dev/null)"
+	[ -n "$id" ] && [ -n "$(strategy_line "$id")" ] && { echo "$id"; return; }
+	strategy_ids | head -n1
+}
+
+# ---------------------------------------------------------------- правила nftables
+
+# Свой стол: перезагрузка firewall (fw4) его не трогает. «bypass» — если nfqws не
+# работает, пакеты проходят как обычно, а не пропадают.
+nft_rules() {
+	cat <<EOF
+table inet $NFT_TABLE {
+  # Первые ответные пакеты нужны nfqws для --dpi-desync-autottl (по ним он считает расстояние до сервера)
+  chain pre {
+    type filter hook prerouting priority -102; policy accept;
+    iifname { "vless0", "lo" } return
+    meta mark & $FWMARK == 0 tcp sport { $TCP_PORTS } ct reply packets 1-3 queue num $QNUM bypass
+  }
+  chain post {
+    type filter hook postrouting priority 102; policy accept;
+    oifname { "vless0", "lo" } return
+    ip daddr { 10.0.0.0/8, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } return
+    ip6 daddr { fc00::/7, fe80::/10, ::1 } return
+    meta mark & $FWMARK == 0 tcp dport { $TCP_PORTS } ct original packets 1-9 queue num $QNUM bypass
+    meta mark & $FWMARK == 0 udp dport { $UDP_PORTS } ct original packets 1-4 queue num $QNUM bypass
+  }
+}
+EOF
+}
+
+nft_up() {
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	nft delete table inet "$NFT_TABLE" 2>/dev/null
+	nft_rules > "$RUN/discord.nft"
+	# счётчики пакетов в conntrack нужны правилу «ct original packets»
+	sysctl -qw net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1
+	nft -f "$RUN/discord.nft" 2>"$RUN/discord.nft.err" || {
+		log "nft: $(head -c 200 "$RUN/discord.nft.err")"
+		return 1
+	}
+}
+nft_down() {
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	nft delete table inet "$NFT_TABLE" 2>/dev/null
+	return 0
+}
+
+# ---------------------------------------------------------------- flow offloading
+# zapret не работает с включённым flow offloading: после рукопожатия поток уходит в
+# ускоренный путь ядра, и nfqws не видит ClientHello. Отключаем и запоминаем, как было.
+
+offload_off() {
+	local sw hw
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	[ "$(cfg discord_offload 1)" = 1 ] || return 0
+	sw="$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null)"
+	hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)"
+	[ "$sw" = 1 ] || [ "$hw" = 1 ] || return 0
+	if [ ! -f "$DD/offload.saved" ]; then
+		printf '%s %s\n' "${sw:-0}" "${hw:-0}" > "$DD/offload.saved.tmp" &&
+			mv "$DD/offload.saved.tmp" "$DD/offload.saved" || {
+				rm -f "$DD/offload.saved.tmp"
+				log "не удалось сохранить исходное состояние flow offloading"
+				return 1
+			}
+	fi
+	if ! uci set firewall.@defaults[0].flow_offloading=0 ||
+		! uci set firewall.@defaults[0].flow_offloading_hw=0 ||
+		! uci commit firewall; then
+		offload_restore
+		log "не удалось отключить flow offloading в UCI"
+		return 1
+	fi
+	if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
+		offload_restore
+		log "не удалось применить настройки firewall для flow offloading"
+		return 1
+	fi
+	log "flow offloading отключён (нужно для zapret); прежние значения сохранены"
+}
+offload_restore() {
+	local sw hw
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	[ -f "$DD/offload.saved" ] || return 0
+	read -r sw hw < "$DD/offload.saved"
+	if ! uci set firewall.@defaults[0].flow_offloading="${sw:-0}" ||
+		! uci set firewall.@defaults[0].flow_offloading_hw="${hw:-0}" ||
+		! uci commit firewall; then
+		log "не удалось восстановить flow offloading в UCI"
+		return 1
+	fi
+	if ! /etc/init.d/firewall reload >/dev/null 2>&1; then
+		log "не удалось применить восстановленные настройки flow offloading"
+		return 1
+	fi
+	rm -f "$DD/offload.saved"
+}
+
+# ---------------------------------------------------------------- чужой zapret
+
+# Свой процесс узнаём по пути к бинарнику; любой другой nfqws — чужой, и два
+# обработчика на один трафик ломают друг друга.
+foreign_nfqws() {
+	local p c
+	for p in $(pgrep -x nfqws 2>/dev/null); do
+		c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+		case "$c" in "$NFQWS "*|"$NFQWS") ;; *) echo "$p" ;; esac
+	done
+}
+own_running() {
+	local p c
+	for p in $(pgrep -x nfqws 2>/dev/null); do
+		c="$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+		case "$c" in "$NFQWS "*|"$NFQWS") return 0 ;; esac
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------- скачивание
+
+have_proxy() { pgrep -x sing-box >/dev/null 2>&1; }
+
+# gh_get URL ФАЙЛ — напрямую, а при неудаче через локальный прокси VPN (GitHub у
+# части провайдеров режется)
+gh_get() {
+	curl -fsSL -m 90 --connect-timeout 10 --retry 1 -H 'Accept: application/vnd.github+json' -o "$2" "$1" 2>/dev/null && return 0
+	have_proxy || return 1
+	curl -fsSL -m 120 --connect-timeout 10 -x "socks5h://127.0.0.1:$MIXED_PORT" -H 'Accept: application/vnd.github+json' -o "$2" "$1" 2>/dev/null
+}
+
+# verify_sha256 ФАЙЛ digest — digest в виде «sha256:hex» (так его отдаёт GitHub API)
+verify_sha256() {
+	local want have
+	want="${2#sha256:}"
+	printf '%s' "$want" | grep -qE '^[0-9a-fA-F]{64}$' || return 1
+	have="$(sha256sum "$1" 2>/dev/null | awk '{print $1}')"
+	[ "$(printf '%s' "$have" | tr 'A-F' 'a-f')" = "$(printf '%s' "$want" | tr 'A-F' 'a-f')" ]
+}
+
+# Каталоги бинарников zapret для архитектуры роутера (в разных релизах имена разные)
+arch_dirs() {
+	local a
+	a="$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_ARCH")"
+	[ -n "$a" ] || a="$(uname -m)"
+	case "$a" in
+		aarch64*|arm64*)    echo "linux-arm64 aarch64" ;;
+		arm*)               echo "linux-arm" ;;
+		x86_64*)            echo "linux-x86_64" ;;
+		i386*|i686*|x86*)   echo "linux-x86" ;;
+		mips64el*)          echo "linux-mips64el" ;;
+		mips64*)            echo "linux-mips64" ;;
+		mipsel*)            echo "linux-mipsel mips32r1-lsb linux-mips32r1-lsb" ;;
+		mips*)              echo "linux-mips mips32r1-msb linux-mips32r1-msb" ;;
+		riscv64*)           echo "linux-riscv64" ;;
+		powerpc*|ppc*)      echo "linux-ppc" ;;
+		*)                  echo "" ;;
+	esac
+}
+
+pm_install() { # pm_install ПАКЕТ…
+	local p
+	if command -v apk >/dev/null 2>&1; then
+		for p in "$@"; do apk info -e "$p" >/dev/null 2>&1 || apk add "$p" >/dev/null 2>&1 || return 1; done
+	elif command -v opkg >/dev/null 2>&1; then
+		for p in "$@"; do opkg list-installed "$p" 2>/dev/null | grep -q "^$p " || opkg install "$p" >/dev/null 2>&1 || return 1; done
+	else
+		return 1
+	fi
+}
+
+install_deps() {
+	if command -v apk >/dev/null 2>&1; then apk update >/dev/null 2>&1; else opkg update >/dev/null 2>&1; fi
+	pm_install kmod-nft-queue kmod-nfnetlink-queue curl jq ca-bundle nftables || return 1
+	modprobe nfnetlink_queue 2>/dev/null; modprobe nft_queue 2>/dev/null
+	return 0
+}
+
+# Скачать и поставить nfqws. Архив проверяется по sha256 из GitHub API, а бинарник —
+# запуском (--dry-run), поэтому подсунуть не тот файл нельзя. Сначала пробуем лёгкий
+# архив «openwrt-embedded», потом полный: в «embedded» нет части архитектур.
+# install_nfqws newer — ничего не делать, если установлена последняя версия.
+install_nfqws() {
+	local w="$RUN/dl.zapret" tag dirs d f found="" url digest tried=0
+	rm -rf "$w"; mkdir -p "$w"
+	dirs="$(arch_dirs)"
+	[ -n "$dirs" ] || { echo "неизвестная архитектура: $(uname -m)"; return 1; }
+	gh_get "$GH_ZAPRET" "$w/rel.json" || { echo "GitHub недоступен (api.github.com)"; return 1; }
+	tag="$(jq -r '.tag_name // empty' "$w/rel.json")"
+	if [ "$1" = newer ] && [ -x "$NFQWS" ] && [ -n "$tag" ] && [ "$tag" = "$(cat "$DD/zapret.version" 2>/dev/null)" ]; then
+		rm -rf "$w"; return 0
+	fi
+	jq -r '[.assets[]? | select(.name | endswith(".tar.gz"))]
+		| (map(select(.name | contains("openwrt-embedded"))) + map(select(.name | contains("openwrt-embedded") | not)))
+		| .[] | [.browser_download_url, (.digest // "")] | @tsv' "$w/rel.json" > "$w/assets.tsv"
+	[ -s "$w/assets.tsv" ] || { echo "в релизе zapret нет подходящего архива"; return 1; }
+	while IFS="$(printf '\t')" read -r url digest; do
+		[ -n "$url" ] || continue
+		[ -n "$digest" ] || { echo "GitHub не отдал контрольную сумму архива — не устанавливаю непроверенный файл"; return 1; }
+		tried=$((tried + 1))
+		rm -f "$w/z.tar.gz"
+		gh_get "$url" "$w/z.tar.gz" || { echo "не удалось скачать архив zapret"; return 1; }
+		verify_sha256 "$w/z.tar.gz" "$digest" || { echo "контрольная сумма архива zapret не совпала"; return 1; }
+		for d in $dirs; do
+			f="$(tar -tzf "$w/z.tar.gz" 2>/dev/null | grep -E "(^|/)binaries/$d/nfqws\$" | head -n1)"
+			[ -n "$f" ] || continue
+			tar -xzf "$w/z.tar.gz" -C "$w" "$f" 2>/dev/null || continue
+			chmod 755 "$w/$f"
+			if "$w/$f" --dry-run --qnum=1 >/dev/null 2>&1; then found="$w/$f"; break; fi
+		done
+		[ -n "$found" ] && break
+	done < "$w/assets.tsv"
+	[ -n "$found" ] || { echo "в релизе zapret нет nfqws, который запускается на этом роутере ($dirs)"; return 1; }
+	[ -x "$NFQWS" ] && cp "$NFQWS" "$NFQWS.bak"
+	cp "$found" "$NFQWS.new" && chmod 755 "$NFQWS.new" && mv "$NFQWS.new" "$NFQWS" || { echo "не удалось записать $NFQWS (мало места?)"; return 1; }
+	printf '%s\n' "$tag" > "$DD/zapret.version"
+	rm -rf "$w"
+	return 0
+}
+
+# Список доменов для nfqws: встроенные из presets.jq + discord-домены из списка Flowseal
+build_list() {
+	local out="$LIST.tmp"
+	{
+		jq -n -r -L "$LIB" 'include "presets"; presets.discord.domains[]' 2>/dev/null
+		echo discord.media
+		[ -s "$DD/lists/flowseal-discord.txt" ] && cat "$DD/lists/flowseal-discord.txt"
+	} | tr -d '\r' | awk '/^[A-Za-z0-9.-]+$/ && !seen[tolower($0)]++ {print tolower($0)}' > "$out"
+	[ -s "$out" ] || { rm -f "$out"; return 1; }
+	chmod 644 "$out"; mv "$out" "$LIST"
+}
+
+# Из релиза Flowseal берём три вещи: .bin-фейки, список доменов Discord и сами стратегии
+# (general*.bat → профили nfqws). Так набор стратегий обновляется вместе с релизом.
+update_assets() { # update_assets [force]
+	local w="$RUN/dl.flowseal" tag cur rel url digest m n=0 count=0
+	rm -rf "$w"; mkdir -p "$w"
+	gh_get "$GH_FLOWSEAL" "$w/rel.json" || { echo "GitHub недоступен (api.github.com)"; return 1; }
+	tag="$(jq -r '.tag_name // empty' "$w/rel.json")"
+	cur="$(cat "$DD/flowseal.version" 2>/dev/null)"
+	if [ "$1" != force ] && [ -n "$tag" ] && [ "$tag" = "$cur" ] && [ -s "$FAKE/tls_clienthello_www_google_com.bin" ] && [ -s "$LIST" ] && [ -s "$STRATS_GEN" ]; then
+		rm -rf "$w"; return 0
+	fi
+	rel="$(jq -c '[.assets[]? | select(.name | endswith(".tar.gz"))] | .[0] // empty' "$w/rel.json")"
+	[ -n "$rel" ] || { echo "в релизе Flowseal нет архива .tar.gz"; return 1; }
+	url="$(printf '%s' "$rel" | jq -r '.browser_download_url')"
+	digest="$(printf '%s' "$rel" | jq -r '.digest // empty')"
+	[ -n "$digest" ] || { echo "GitHub не отдал контрольную сумму архива Flowseal"; return 1; }
+	gh_get "$url" "$w/f.tar.gz" || { echo "не удалось скачать архив Flowseal"; return 1; }
+	verify_sha256 "$w/f.tar.gz" "$digest" || { echo "контрольная сумма архива Flowseal не совпала"; return 1; }
+	# Только нужные файлы и только с безопасными путями: .bin-фейки, список доменов и general*.bat.
+	tar -tzf "$w/f.tar.gz" 2>/dev/null | grep -E '(^|/)(bin/[A-Za-z0-9._-]+\.bin|lists/list-general\.txt|general[^/]*\.bat)$' | grep -v '\.\.' > "$w/members"
+	[ -s "$w/members" ] || { echo "в архиве Flowseal нет ни bin/*.bin, ни general*.bat"; return 1; }
+	while IFS= read -r m; do tar -xzf "$w/f.tar.gz" -C "$w" "$m" 2>/dev/null; done < "$w/members"
+	while IFS= read -r m; do
+		case "$m" in
+			*.bin) [ -s "$w/$m" ] && cp "$w/$m" "$FAKE/$(basename "$m")" && chmod 644 "$FAKE/$(basename "$m")" && n=$((n + 1)) ;;
+			*list-general.txt) [ -s "$w/$m" ] && tr -d '\r' < "$w/$m" | grep -i discord > "$DD/lists/flowseal-discord.txt" ;;
+		esac
+	done < "$w/members"
+	[ "$n" -gt 0 ] || { echo "в архиве Flowseal не нашлось ни одного .bin"; return 1; }
+	# Если .bat разобрать не удалось (формат поменялся), остаются прежние и встроенные стратегии.
+	count="$(build_strategies "$w")" || log "из релиза Flowseal не удалось разобрать general*.bat — работают встроенные стратегии"
+	printf '%s\n' "$tag" > "$DD/flowseal.version"
+	printf '%s\n' "${count:-0}" > "$DD/flowseal.strategies"
+	build_list
+	rm -rf "$w"
+	return 0
+}
+
+# ---------------------------------------------------------------- проверка Discord
+
+# Адреса, без которых Discord не работает: API, gateway (вебсокет) и CDN.
+# Любой HTTP-ответ (даже 403/404) означает, что TLS-рукопожатие прошло.
+probe_one() { # probe_one URL ФАЙЛ-результата [ФАЙЛ-тела]
+	local code
+	if [ -n "$3" ]; then
+		code="$(curl -s -m 8 --connect-timeout 5 -o "$3" -w '%{http_code}' "$1" 2>/dev/null)"
+	else
+		code="$(curl -s -m 8 --connect-timeout 5 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null)"
+	fi
+	case "$code" in ""|000) echo 0 > "$2" ;; *) echo 1 > "$2" ;; esac
+}
+
+# probe — 0, если Discord доступен. Запросы идут параллельно, чтобы перебор был быстрым.
+# Они выходят с самого роутера, а правила nfqws действуют и на его собственный трафик,
+# так что проверка честно проверяет выбранную стратегию.
+probe() {
+	local d="$RUN/probe.$$" ok=0
+	if [ -n "$DISCORD_FAKE_PROBE_OK" ]; then # проверка тестами: «успех», если текущая стратегия в списке
+		case " $DISCORD_FAKE_PROBE_OK " in *" $(current_id) "*) return 0 ;; esac
+		return 1
+	fi
+	rm -rf "$d"; mkdir -p "$d"
+	probe_one "https://discord.com/api/v9/gateway" "$d/api" "$d/api.body" &
+	probe_one "https://gateway.discord.gg/" "$d/gw" &
+	probe_one "https://cdn.discordapp.com/" "$d/cdn" &
+	probe_one "https://media.discordapp.net/" "$d/media" &
+	wait
+	# API должен вернуть настоящий JSON с адресом gateway: страница-заглушка провайдера не считается
+	jq -e '.url' "$d/api.body" >/dev/null 2>&1 || echo 0 > "$d/api"
+	[ "$(cat "$d/api")" = 1 ] && [ "$(cat "$d/gw")" = 1 ] && ok=1
+	# CDN и media — хотя бы один из двух (у них бывают свои сбои)
+	[ "$(cat "$d/cdn")" = 1 ] || [ "$(cat "$d/media")" = 1 ] || ok=0
+	rm -rf "$d"
+	[ "$ok" = 1 ]
+}
+
+# ---------------------------------------------------------------- служба nfqws
+
+service_cmdline() { # «бинарник аргументы» — строка для procd
+	local id args
+	id="$(current_id)"
+	args="$(strategy_args "$id")" || return 1
+	printf '%s %s\n' "$NFQWS" "$args"
+}
+
+# prestart — подготовка перед запуском nfqws (вызывает init.d); код ≠ 0 = не запускать
+prestart() {
+	local mode
+	mode="$(cfg discord_mode off)"
+	case "$mode" in auto|zapret) ;; *) return 1 ;; esac
+	[ -x "$NFQWS" ] || { log "nfqws не установлен — запуск отложен"; return 1; }
+	if [ -n "$(foreign_nfqws)" ]; then
+		log "найден чужой nfqws (другой zapret?) — не запускаюсь, чтобы не мешать"
+		state_set conflict true
+		return 1
+	fi
+	state_set conflict false
+	[ -n "$DISCORD_NO_SERVICE" ] || { modprobe nfnetlink_queue 2>/dev/null; modprobe nft_queue 2>/dev/null; }
+	[ -s "$LIST" ] || build_list || { log "нет списка доменов Discord"; return 1; }
+	service_cmdline >/dev/null || { log "нет доступной стратегии nfqws"; return 1; }
+	offload_off || return 1
+	nft_up || { offload_restore; return 1; }
+	return 0
+}
+
+svc_restart() {
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	/etc/init.d/vless-discord restart >/dev/null 2>&1
+}
+svc_stop() {
+	[ -n "$DISCORD_NO_SERVICE" ] && return 0
+	/etc/init.d/vless-discord stop >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------- переключение маршрута
+
+# set_active zapret|vpn|off|error ПРИЧИНА — запомнить, куда идёт Discord; при смене
+# сообщить основному скрипту, чтобы он пересобрал маршруты VPN.
+set_active() {
+	local prev; prev="$(active)"
+	printf '%s\n' "$1" > "$ACTIVE"
+	state_set active "$(jstr "$1")" reason "$(jstr "$2")" last_check "$(now)"
+	[ "$prev" = "$1" ] || state_set since "$(now)"
+	if [ "$prev" != "$1" ]; then
+		log "Discord: $prev → $1${2:+ ($2)}"
+		[ -n "$DISCORD_NO_SYNC" ] || "$VLESS_BIN" discord-sync >/dev/null 2>&1
+	fi
+}
+
+vpn_servers() { jq -r '[.[]? | select(.supported==true and .outbound!=null)] | length' "$DIR/servers.json" 2>/dev/null || echo 0; }
+
+# ---------------------------------------------------------------- перебор стратегий
+
+select_strategy() {
+	local id order chosen tried=0 results="[]" n_ok=0 tried_ids=""
+	chosen="$(cat "$DD/chosen" 2>/dev/null)"
+	order="$chosen $(strategy_ids)"
+	state_set busy "$(jstr "перебор стратегий")"
+	for id in $order; do
+		[ -n "$id" ] || continue
+		# повторно одну и ту же не пробуем
+		case " $tried_ids " in *" $id "*) continue ;; esac
+		tried_ids="$tried_ids $id"
+		if ! usable "$id"; then
+			results="$(printf '%s' "$results" | jq -c --arg id "$id" '. + [{id:$id, ok:false, skipped:true}]')"
+			continue
+		fi
+		tried=$((tried + 1))
+		printf '%s\n' "$id" > "$DD/current"
+		svc_restart
+		sleep "${DISCORD_SETTLE:-2}"
+		if probe; then
+			printf '%s\n' "$id" > "$DD/chosen"
+			results="$(printf '%s' "$results" | jq -c --arg id "$id" '. + [{id:$id, ok:true}]')"
+			state_set results "$results" strategy "$(jstr "$id")" busy '""'
+			n_ok=1
+			break
+		fi
+		results="$(printf '%s' "$results" | jq -c --arg id "$id" '. + [{id:$id, ok:false}]')"
+	done
+	if [ "$n_ok" != 1 ]; then
+		state_set results "$results" busy '""' tried "$tried"
+		# Не оставляем в работе последнюю из проверенных (самую слабую): возвращаем ту, что
+		# работала раньше, а если такой нет — первую доступную. В режиме «только zapret»
+		# именно она останется обрабатывать трафик.
+		id="$chosen"
+		if [ -z "$id" ] || ! usable "$id"; then
+			id=""
+			for chosen in $(strategy_ids); do usable "$chosen" && { id="$chosen"; break; }; done
+		fi
+		[ -n "$id" ] && printf '%s\n' "$id" > "$DD/current" && svc_restart
+	fi
+	[ "$n_ok" = 1 ]
+}
+
+fallback() { # fallback ПРИЧИНА — ни одна стратегия не подошла
+	local mode; mode="$(cfg discord_mode off)"
+	svc_stop
+	nft_down
+	offload_restore
+	if [ "$mode" = auto ]; then
+		if [ "$(vpn_servers)" -gt 0 ]; then
+			set_active vpn "$1 — Discord идёт через VPN"
+		else
+			set_active error "$1; запасной VPN недоступен: нет серверов"
+		fi
+	else
+		set_active error "$1"
+	fi
+}
+
+ensure_installed() {
+	local err
+	if [ ! -x "$NFQWS" ]; then
+		state_set busy "$(jstr "установка zapret")"
+		install_deps || { state_set busy '""'; echo "не удалось установить пакеты (kmod-nft-queue, kmod-nfnetlink-queue)"; return 1; }
+		if ! err="$(install_nfqws)"; then state_set busy '""'; echo "$err"; return 1; fi
+	fi
+	if [ ! -s "$FAKE/tls_clienthello_www_google_com.bin" ] || [ ! -s "$LIST" ]; then
+		state_set busy "$(jstr "загрузка стратегий Flowseal")"
+		# без файлов Flowseal работают стратегии без .bin; список доменов строим из встроенных
+		update_assets >/dev/null 2>&1
+		[ -s "$LIST" ] || build_list || { state_set busy '""'; echo "не удалось собрать список доменов"; return 1; }
+	fi
+	state_set busy '""'
+	return 0
+}
+
+# auto [force] — главная операция: проверить, что Discord работает, и при необходимости
+# подобрать стратегию или переключиться на VPN. Её же вызывает cron и кнопка «Проверить».
+cmd_auto() {
+	local force=0 mode cur err fails t retry
+	[ "$1" = force ] && force=1
+	mode="$(cfg discord_mode off)"
+	case "$mode" in
+		off) cmd_off; return ;;
+		vpn)
+			svc_stop
+			set_active vpn "режим «Discord через VPN»"
+			cmd_status; return ;;
+	esac
+
+	if ! err="$(ensure_installed)"; then
+		fallback "не удалось подготовить zapret: $err"
+		cmd_status; return
+	fi
+	if [ -n "$(foreign_nfqws)" ]; then
+		state_set conflict true
+		fallback "уже работает другой nfqws (другой zapret?)"
+		cmd_status; return
+	fi
+	own_running || { svc_restart; sleep "${DISCORD_SETTLE:-2}"; }
+
+	cur="$(active)"
+	case "$cur" in
+		zapret)
+			if probe; then
+				state_set fails 0 last_check "$(now)" reason '""'
+				cmd_status; return
+			fi
+			fails="$(state_get fails)"; fails=$((${fails:-0} + 1))
+			state_set fails "$fails" last_check "$(now)"
+			# одиночный сбой — не повод менять маршрут: сеть могла просто моргнуть
+			if [ "$force" = 0 ] && [ "$fails" -lt 2 ]; then
+				state_set reason "$(jstr "проверка не прошла (1 из 2), повторю")"
+				cmd_status; return
+			fi ;;
+		vpn|error)
+			# После неудачного перебора повторяем не чаще, чем раз в несколько часов (на VPN)
+			# или раз в полчаса (если запасного пути нет): полный перебор — это минуты
+			# нагрузки на роутер и мигание обхода.
+			t="$(state_get since)"
+			[ "$cur" = error ] && retry=1800 || retry="$RETRY_SECS"
+			if [ "$force" = 0 ] && [ -n "$t" ] && [ $(($(now) - t)) -lt "$retry" ]; then
+				state_set last_check "$(now)"
+				cmd_status; return
+			fi ;;
+	esac
+
+	if select_strategy; then
+		state_set fails 0
+		set_active zapret ""
+	else
+		fallback "ни одна стратегия zapret не подошла"
+	fi
+	cmd_status
+}
+
+cmd_off() {
+	svc_stop
+	[ -n "$DISCORD_NO_SERVICE" ] || /etc/init.d/vless-discord disable >/dev/null 2>&1
+	nft_down
+	offload_restore
+	set_active off ""
+	state_set busy '""' fails 0
+	cmd_status
+}
+
+# apply — применить настройки (вызывается после сохранения в интерфейсе, в фоне)
+cmd_apply() {
+	local mode
+	mode="$(cfg discord_mode off)"
+	sync_cron
+	case "$mode" in
+		off) cmd_off ;;
+		vpn)
+			[ -n "$DISCORD_NO_SERVICE" ] || /etc/init.d/vless-discord disable >/dev/null 2>&1
+			svc_stop; nft_down; offload_restore
+			set_active vpn "режим «Discord через VPN»"
+			cmd_status ;;
+		*)
+			[ -n "$DISCORD_NO_SERVICE" ] || /etc/init.d/vless-discord enable >/dev/null 2>&1
+			cmd_auto force ;;
+	esac
+}
+
+# cron: проверка каждые 10 минут, обновление nfqws и стратегий Flowseal раз в сутки
+sync_cron() {
+	local f="${VLESS_CRON:-/etc/crontabs/root}" mode grc
+	mode="$(cfg discord_mode off)"
+	mkdir -p "$(dirname "$f")"
+	[ -f "$f" ] || { touch "$f"; chmod 600 "$f" 2>/dev/null; }
+	grep -v -F '/usr/bin/vless-discord ' "$f" > "$f.tmp" 2>/dev/null
+	grc=$?
+	if [ "$grc" -gt 1 ]; then rm -f "$f.tmp"; return 1; fi
+	case "$mode" in
+		auto|zapret)
+			echo "*/10 * * * * /usr/bin/vless-discord auto >/dev/null 2>&1" >> "$f.tmp"
+			echo "23 4 * * * /usr/bin/vless-discord update >/dev/null 2>&1" >> "$f.tmp" ;;
+		vpn)
+			# VPN-сервис сам следит за собой; от cron нужна только повторная настройка после сбоя
+			echo "*/30 * * * * /usr/bin/vless-discord auto >/dev/null 2>&1" >> "$f.tmp" ;;
+	esac
+	if ! cmp -s "$f" "$f.tmp"; then
+		chmod --reference="$f" "$f.tmp" 2>/dev/null || chmod 600 "$f.tmp" 2>/dev/null
+		mv "$f.tmp" "$f"
+		[ -x /etc/init.d/cron ] && /etc/init.d/cron restart >/dev/null 2>&1
+	else
+		rm -f "$f.tmp"
+	fi
+}
+
+# ---------------------------------------------------------------- команды для интерфейса
+
+cmd_install() {
+	local err
+	state_set busy "$(jstr "установка zapret")"
+	if ! install_deps; then state_set busy '""'; json_err "Не удалось установить пакеты kmod-nft-queue и kmod-nfnetlink-queue"; return 1; fi
+	if ! err="$(install_nfqws)"; then state_set busy '""'; json_err "$err"; return 1; fi
+	state_set busy "$(jstr "загрузка стратегий Flowseal")"
+	err="$(update_assets force)" || { state_set busy '""'; build_list; json_err "nfqws установлен, но файлы Flowseal не скачались: $err"; return 1; }
+	state_set busy '""'
+	jq -n -c '{ok:true}'
+}
+
+# update — обновить nfqws (если вышла новая версия), фейки, список доменов и стратегии Flowseal.
+# Работающий обход не ломаем: после обновления перезапускаем nfqws и проверяем Discord; если
+# проверка не проходит, запускается обычный перебор стратегий уже по свежему набору.
+cmd_update() {
+	local err old_z old_f old_s old_l new_z new_f new_s new_l
+	[ -x "$NFQWS" ] || { json_err "zapret ещё не установлен"; return 1; }
+	old_z="$(cat "$DD/zapret.version" 2>/dev/null)"; old_f="$(cat "$DD/flowseal.version" 2>/dev/null)"
+	old_s="$(md5sum "$STRATS_GEN" 2>/dev/null | cut -d' ' -f1)"
+	old_l="$(md5sum "$LIST" 2>/dev/null | cut -d' ' -f1)"
+	state_set busy "$(jstr "обновление nfqws")"
+	err="$(install_nfqws newer)" || { state_set busy '""'; json_err "обновление nfqws: $err"; return 1; }
+	state_set busy "$(jstr "обновление стратегий")"
+	err="$(update_assets)" || { state_set busy '""'; json_err "$err"; return 1; }
+	state_set busy '""'
+	new_z="$(cat "$DD/zapret.version" 2>/dev/null)"; new_f="$(cat "$DD/flowseal.version" 2>/dev/null)"
+	new_s="$(md5sum "$STRATS_GEN" 2>/dev/null | cut -d' ' -f1)"
+	new_l="$(md5sum "$LIST" 2>/dev/null | cut -d' ' -f1)"
+	# запомненной стратегии больше нет в наборе — забываем её, пусть подберётся заново
+	[ -n "$(cat "$DD/chosen" 2>/dev/null)" ] && [ -z "$(strategy_line "$(cat "$DD/chosen")")" ] && rm -f "$DD/chosen" "$DD/current"
+	if [ "$old_z" != "$new_z" ] || [ "$old_f" != "$new_f" ] ||
+		[ "$old_s" != "$new_s" ] || [ "$old_l" != "$new_l" ]; then
+		log "обновлено: nfqws ${old_z:-—} → ${new_z:-—}, Flowseal ${old_f:-—} → ${new_f:-—}"
+		case "$(cfg discord_mode off)" in
+			auto|zapret)
+				svc_restart; sleep "${DISCORD_SETTLE:-2}"
+				probe || { log "после обновления Discord не открывается — подбираю стратегию заново"; ( cmd_auto force >/dev/null ); } ;;
+		esac
+	fi
+	jq -n -c '{ok:true}'
+}
+
+# bg ДЕЙСТВИЕ — запустить долгую операцию в фоне и сразу ответить (rpcd ждёт недолго)
+cmd_bg() {
+	local what
+	case "$1" in install|update|auto|apply) ;; *) json_err "неизвестное действие"; return 1 ;; esac
+	what="$(busy_what)"
+	[ -z "$what" ] || { json_err "Занято: сейчас выполняется «$what»"; return 1; }
+	case "$1" in
+		auto) ( "$0" auto force >/dev/null 2>&1 & ) ;;
+		*)    ( "$0" "$1" >/dev/null 2>&1 & ) ;;
+	esac
+	jq -n -c '{ok:true,started:true}'
+}
+
+cmd_status() {
+	local mode inst ver fver run id name busy
+	mode="$(cfg discord_mode off)"
+	[ -x "$NFQWS" ] && inst=true || inst=false
+	ver="$(cat "$DD/zapret.version" 2>/dev/null)"
+	fver="$(cat "$DD/flowseal.version" 2>/dev/null)"
+	own_running && run=true || run=false
+	id="$(cat "$DD/chosen" 2>/dev/null)"
+	name=""; [ -n "$id" ] && name="$(strategy_name "$id")"
+	busy="$(busy_what)"
+	[ -s "$STATE" ] || echo '{}' > "$STATE"
+	jq -c --arg mode "$mode" --argjson inst "$inst" --arg ver "$ver" --arg fver "$fver" --argjson run "$run" \
+		--arg active "$(active)" --arg strategy "$id" --arg sname "$name" --arg busy "$busy" \
+		--argjson servers "$(vpn_servers)" --argjson total "$(strategy_ids | wc -l)" --argjson offload "$([ -f "$DD/offload.saved" ] && echo true || echo false)" \
+		--argjson only "$([ -f "$RUN/discord.vpn_only" ] && echo true || echo false)" '
+		{ mode:$mode, installed:$inst, zapret:$ver, flowseal:$fver, running:$run, active:$active,
+		  strategy:$strategy, strategy_name:$sname, busy:(if ($busy|length)>0 then $busy else (.busy // "") end),
+		  since:(.since // 0), last_check:(.last_check // 0), reason:(.reason // ""), fails:(.fails // 0),
+		  results:(.results // []), conflict:(.conflict // false), vpn_servers:$servers, strategies:$total,
+		  offload_disabled:$offload, vpn_only:$only, now:(now|floor) }' "$STATE" 2>/dev/null || json_err "нет состояния"
+}
+
+# use ID — вручную закрепить стратегию (перебор и запоминание не затрагиваются) и сразу проверить
+cmd_use() {
+	local id="$1"
+	[ -n "$(strategy_line "$id")" ] || { echo "нет такой стратегии: $id (список: vless-discord strategies)"; return 1; }
+	usable "$id" || { echo "стратегия $id недоступна (нет .bin-файла или nfqws не принимает аргументы)"; return 1; }
+	printf '%s\n' "$id" > "$DD/current"
+	printf '%s\n' "$id" > "$DD/chosen"
+	svc_restart
+	sleep "${DISCORD_SETTLE:-2}"
+	if probe; then echo "стратегия $id: Discord открывается"; else echo "стратегия $id: Discord НЕ открывается"; return 1; fi
+}
+
+# test — подробная диагностика для терминала: что отвечает каждый адрес и доходят ли пакеты до nfqws
+cmd_test() {
+	local u r
+	echo "стратегия: $(current_id) — $(strategy_name "$(current_id)")"
+	echo "nfqws:     $(own_running && echo работает || echo НЕ РАБОТАЕТ)"
+	echo "nft:       $(nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && echo 'правила загружены' || echo 'ПРАВИЛ НЕТ')"
+	echo "очередь $QNUM (id_sequence растёт, когда nfqws получает пакеты):"
+	grep -E "^ *$QNUM " /proc/net/netfilter/nfnetlink_queue 2>/dev/null || echo "  очереди нет — nfqws не запущен или не загружен nfnetlink_queue"
+	echo "адреса (код ответа, время TCP, время TLS):"
+	for u in https://discord.com/api/v9/gateway https://gateway.discord.gg/ https://cdn.discordapp.com/ https://media.discordapp.net/; do
+		r="$(curl -s -o /dev/null -m 8 --connect-timeout 5 -w '%{http_code} %{time_connect} %{time_appconnect}' "$u" 2>&1)"
+		printf '  %-40s %s (curl rc=%s)\n' "$u" "$r" "$?"
+	done
+	echo "voice-порты UDP в правилах: $UDP_PORTS"
+}
+
+cmd_selftest() {
+	local id n=0 u=0
+	echo "nfqws:    $([ -x "$NFQWS" ] && "$NFQWS" --version 2>&1 | head -n1 || echo 'НЕ УСТАНОВЛЕН (vless-discord install)')"
+	echo "kmod:     $(lsmod 2>/dev/null | grep -q nfnetlink_queue && echo ok || echo 'nfnetlink_queue не загружен')"
+	echo "фейки:    $(ls "$FAKE"/*.bin 2>/dev/null | wc -l) файлов, Flowseal $(cat "$DD/flowseal.version" 2>/dev/null || echo '—')"
+	echo "список:   $([ -s "$LIST" ] && wc -l < "$LIST" || echo 'нет') доменов"
+	for id in $(strategy_ids); do
+		n=$((n + 1)); usable "$id" && u=$((u + 1))
+	done
+	echo "стратегий: $n, доступно к запуску: $u"
+	echo "offload:  $(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || echo 0) (для zapret должен быть 0)"
+	echo "чужой nfqws: $([ -n "$(foreign_nfqws)" ] && echo 'ЕСТЬ' || echo 'нет')"
+}
+
+case "$1" in
+	status)     cmd_status ;;
+	auto)       exclusive "проверка Discord" cmd_auto "$2" ;;
+	apply)      exclusive "применение настроек" cmd_apply ;;
+	install)    exclusive "установка zapret" cmd_install ;;
+	update)     exclusive "обновление стратегий" cmd_update ;;
+	bg)         cmd_bg "$2" ;;
+	prestart)   prestart ;;
+	cmdline)    service_cmdline ;;
+	nft-up)     nft_up ;;
+	nft-down)   nft_down ;;
+	nft-rules)  nft_rules ;;
+	args)       strategy_args "$2" ;;
+	strategies) strategy_ids ;;
+	bat2profiles) bat2profiles "$2" ;;
+	build-strategies) build_strategies "$2" ;;
+	sync-cron)  sync_cron ;;
+	selftest)   cmd_selftest ;;
+	test)       cmd_test ;;
+	use)        exclusive "выбор стратегии" cmd_use "$2" ;;
+	*)
+		echo "Использование: vless-discord {status|auto [force]|apply|install|update|bg <действие>|selftest|test|use <id>|strategies|args <id>}" >&2
+		exit 1 ;;
+esac

@@ -14,7 +14,7 @@ echo '[]' > "$TMP/servers.json"
 fail=0
 compile() { # compile ОПИСАНИЕ КОМАНДА...
 	desc="$1"; shift
-	err="$("$@" 2>&1 >/dev/null || true)"
+	err="$("$@" < /dev/null 2>&1 >/dev/null || true)"
 	case "$err" in
 		*"compile error"*|*"syntax error"*)
 			printf '  FAIL %s\n' "$desc"

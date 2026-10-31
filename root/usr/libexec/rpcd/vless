@@ -4,6 +4,13 @@
 VLESS="${VLESS_BIN:-/usr/bin/vless}"
 RUN="${VLESS_RUN:-/var/run/vless}"
 
+log_err() {
+	[ -s "$RUN/rpcd.err" ] || return 0
+	local msg
+	msg="$(tr '\n' ' ' < "$RUN/rpcd.err" 2>/dev/null | cut -c 1-200 2>/dev/null)"
+	[ -n "$msg" ] && logger -t vless "rpcd $1: $msg" 2>/dev/null
+}
+
 # run КОМАНДА [АРГУМЕНТЫ…] — вызвать бэкенд; stderr логируется в $RUN/rpcd.err
 run() {
 	local out
@@ -12,8 +19,19 @@ run() {
 		printf '%s\n' "$out"
 	else
 		# Логируем stderr бэкенда для диагностики
-		[ -s "$RUN/rpcd.err" ] && logger -t vless "rpcd $1: $(head -c 200 "$RUN/rpcd.err")" 2>/dev/null
+		log_err "$1"
 		printf '{"ok":false,"error":"Бэкенд не ответил (команда %s). Выполните на роутере: vless selftest"}\n' "$1"
+	fi
+}
+
+# run_discord КОМАНДА [АРГУМЕНТЫ…] — то же для vless-discord
+run_discord() {
+	local out
+	out="$("${VLESS_DISCORD_BIN:-/usr/bin/vless-discord}" "$@" 2>"$RUN/rpcd.err")"
+	if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+		printf '%s\n' "$out"
+	else
+		printf '{"ok":false,"error":"Модуль Discord не ответил. Выполните на роутере: vless-discord selftest"}\n'
 	fi
 }
 
@@ -36,7 +54,9 @@ case "$1" in
 	"remove":     { "id": "string" },
 	"refresh":    { "id": "string" },
 	"select":     { "id": "string" },
-	"set":        { "settings": "object" }
+	"set":        { "settings": "object" },
+	"discord-status": {},
+	"discord-run":    { "action": "string" }
 }
 JSON
 		;;
@@ -58,9 +78,17 @@ JSON
 				if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
 					printf '%s\n' "$out"
 				else
-					[ -s "$RUN/rpcd.err" ] && logger -t vless "rpcd add: $(head -c 200 "$RUN/rpcd.err")" 2>/dev/null
+					log_err add
 					printf '{"ok":false,"error":"Не удалось добавить серверы"}\n'
 				fi ;;
+			discord-status)
+				run_discord status ;;
+			discord-run)
+				# только фоновый запуск: установка и перебор стратегий идут минуты, rpcd столько не ждёт
+				case "$(arg action)" in
+					install|update|auto|apply) run_discord bg "$(arg action)" ;;
+					*) echo '{"ok":false,"error":"unknown action"}' ;;
+				esac ;;
 			set)
 				out="$(printf '%s' "$IN" | jq -c '.settings // {}' | "$VLESS" set 2>"$RUN/rpcd.err")"
 				if [ -n "$out" ]; then printf '%s\n' "$out"; else echo '{"ok":false,"error":"Не удалось сохранить настройки"}'; fi ;;

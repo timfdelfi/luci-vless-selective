@@ -11,19 +11,29 @@ say "Останавливаю VPN"
 /etc/init.d/vless disable 2>/dev/null
 /usr/bin/vless net-down 2>/dev/null
 
+say "Останавливаю обход Discord (zapret)"
+# Возвращает flow offloading, если его отключал модуль, и убирает свои правила nftables.
+if [ -x /usr/bin/vless-discord ]; then
+	uci -q set vless.main.discord_mode=off && uci -q commit vless
+	/usr/bin/vless-discord apply >/dev/null 2>&1
+fi
+/etc/init.d/vless-discord stop 2>/dev/null
+/etc/init.d/vless-discord disable 2>/dev/null
+nft delete table inet vless_dpi 2>/dev/null
+
 say "Убираю задачу автообновления"
 # grep -v отнимает 1 и когда строк не осталось; код 2 означает настоящую ошибку.
 if [ -f /etc/crontabs/root ]; then
-	grep -v -F '/usr/bin/vless update-all' /etc/crontabs/root > /tmp/cron.vless 2>/dev/null
+	grep -v -F -e '/usr/bin/vless update-all' -e '/usr/bin/vless-discord ' /etc/crontabs/root > /tmp/cron.vless 2>/dev/null
 	[ $? -le 1 ] && mv /tmp/cron.vless /etc/crontabs/root || rm -f /tmp/cron.vless
 fi
 
 say "Удаляю файлы"
-rm -f /usr/bin/vless /etc/init.d/vless /usr/libexec/rpcd/vless /etc/config/vless \
+rm -f /usr/bin/vless /usr/bin/vless-discord /etc/init.d/vless /etc/init.d/vless-discord /usr/libexec/rpcd/vless /etc/config/vless \
       /usr/share/rpcd/acl.d/luci-vless-selective.json /usr/share/luci/menu.d/luci-vless-selective.json \
       /usr/share/nftables.d/chain-pre/input/20-vless.nft /usr/share/nftables.d/chain-pre/forward/20-vless.nft \
       /etc/uci-defaults/90-vless
-rm -rf /usr/share/vless /www/luci-static/resources/view/vless /var/run/vless
+rm -rf /usr/share/vless /www/luci-static/resources/view/vless /var/run/vless /etc/vless-discord
 
 if [ "$PURGE" = "--purge" ]; then
 	# Здесь лежат UUID, пароли и токены подписок. Без --purge они остаются.

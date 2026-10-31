@@ -9,6 +9,7 @@
 #
 # scope = "all"      — через VPN идёт всё (bypass_ru = «кроме российских сайтов»)
 # scope = "selected" — через VPN идут только выбранные пресеты и proxy_domains, остальное напрямую
+# zapret_udp = true  — UDP 19294-19344 и 50000-50100 (голос Discord) идёт напрямую, мимо туннеля
 
 include "presets";
 
@@ -101,6 +102,9 @@ def plain: ltrimstr("*.") | select(contains("*") | not);
           { ip_is_private: true, outbound: "direct" } ]
         + (if ($dd_ips | length) > 0 then [{ ip_cidr: $dd_ips, outbound: "direct" }] else [] end)
         + (if ($dd_domains | length) > 0 then [{ domain_suffix: $dd_domains, outbound: "direct" }] else [] end)
+        # Discord идёт через zapret (nfqws): голос и демонстрация экрана — UDP на этих портах, домена у них нет,
+        # поэтому без правила по портам они ушли бы в VPN вместе со всем остальным.
+        + (if ($s.zapret_udp == true) then [{ network: "udp", port_range: ["19294:19344", "50000:50100"], outbound: "direct" }] else [] end)
         + (if $sel then
              # режем QUIC только у тех, кто идёт через VPN; остальной трафик не трогаем
              (if $quic and ($sel_domains | length) > 0 then [{ network: "udp", port: 443, domain_suffix: $sel_domains, action: "reject" }] else [] end)

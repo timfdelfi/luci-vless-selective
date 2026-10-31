@@ -68,13 +68,20 @@ cj "QUIC режется после правил «напрямую»"       '([.
 cj "reject-правило QUIC присутствует"           '[.route.rules[]|select(.action=="reject" and .port==443)]|length==1'
 
 echo "== функции бэкенда"
-eval "$(sed -n '/^valid_ip()/,/^}/p;/^valid_cidr()/,/^}/p;/^cron_spec()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^valid_ip()/,/^}/p;/^valid_cidr()/,/^}/p;/^valid_ipv6()/,/^}/p;/^valid_domain()/,/^}/p;/^valid_route_target()/,/^}/p;/^cron_spec()/,/^}/p' root/usr/bin/vless)"
 valid_ip 192.168.1.1 && ok "valid_ip: 192.168.1.1" || bad "valid_ip: 192.168.1.1"
 valid_ip 999.1.1.1 && bad "valid_ip: 999.1.1.1 отклонён" || ok "valid_ip: 999.1.1.1 отклонён"
 valid_ip 1.2.3 && bad "valid_ip: 1.2.3 отклонён" || ok "valid_ip: 1.2.3 отклонён"
 valid_cidr 10.0.0.0/8 && ok "valid_cidr: 10.0.0.0/8" || bad "valid_cidr: 10.0.0.0/8"
 valid_cidr 10.0.0.0/33 && bad "valid_cidr: /33 отклонён" || ok "valid_cidr: /33 отклонён"
 valid_cidr 10.0.0.1/ && bad "valid_cidr: пустая маска отклонена" || ok "valid_cidr: пустая маска отклонена"
+valid_route_target '*.example.org' && ok "маршрут: wildcard-домен принимается" || bad "маршрут: wildcard-домен"
+valid_route_target 2001:db8::/32 && ok "маршрут: корректный IPv6 CIDR принимается" || bad "маршрут: IPv6 CIDR"
+valid_route_target ::ffff:192.0.2.1 && ok "маршрут: IPv4-mapped IPv6 принимается" || bad "маршрут: IPv4-mapped IPv6"
+valid_route_target 2001:db8:::1 && bad "маршрут: некорректный IPv6 отклонён" || ok "маршрут: некорректный IPv6 отклонён"
+valid_route_target 999.1.1.1 && bad "маршрут: IP с октетом >255 отклонён" || ok "маршрут: IP с октетом >255 отклонён"
+valid_route_target 192.0.2.0/33 && bad "маршрут: CIDR /33 отклонён" || ok "маршрут: CIDR /33 отклонён"
+valid_route_target example..org && bad "маршрут: пустая метка домена отклонена" || ok "маршрут: пустая метка домена отклонена"
 [ "$(cron_spec 6)" = "17 */6 * * *" ] && ok "cron: каждые 6 часов" || bad "cron: каждые 6 часов"
 [ "$(cron_spec 72)" = "17 4 */3 * *" ] && ok "cron: раз в 3 дня" || bad "cron: раз в 3 дня"
 [ "$(cron_spec 168)" = "17 4 */7 * *" ] && ok "cron: раз в неделю" || bad "cron: раз в неделю"
@@ -113,6 +120,8 @@ rm -rf "$tmp"
 
 echo
 sh tests/backend.sh || fail=1
+echo
+sh tests/discord.sh || fail=1
 echo
 [ $fail -eq 0 ] && echo "ВСЕ ТЕСТЫ ПРОЙДЕНЫ" || echo "ЕСТЬ ОШИБКИ"
 exit $fail

@@ -71,9 +71,80 @@ valid_ip() { # четыре числа 0–255
 }
 valid_cidr() { # IP или IP/маска (0–32)
 	case "$1" in
-		*/*) printf '%s' "${1#*/}" | grep -qE '^[0-9]{1,2}$' && [ "${1#*/}" -le 32 ] || return 1 ;;
+		*/*)
+			local mask="${1#*/}"
+			case "$mask" in *'/'*) return 1 ;; esac
+			case "$mask" in
+				''|*[!0-9]*) return 1 ;;
+			esac
+			[ "$mask" -le 32 ] 2>/dev/null || return 1
+			;;
 	esac
 	valid_ip "${1%%/*}"
+}
+
+valid_ipv6() { # IPv6-адрес или адрес/префикс
+	local addr="$1" prefix="${1#*/}" embedded
+	case "$1" in
+		*/*)
+			case "$prefix" in ''|*[!0-9]*|*/*) return 1 ;; esac
+			[ "$prefix" -le 128 ] 2>/dev/null || return 1
+			addr="${1%%/*}"
+			;;
+	esac
+	case "$addr" in *:*) ;; *) return 1 ;; esac
+	case "$addr" in
+		*.*)
+			embedded="${addr##*:}"
+			[ "$embedded" != "$addr" ] && valid_ip "$embedded" || return 1
+			addr="${addr%:*}:ffff:ffff"
+			;;
+	esac
+	awk -v ip="$addr" '
+		BEGIN {
+			if (index(ip, ":::")) exit 1
+			copy = ip
+			compressed = sub(/::/, "", copy)
+			if (index(copy, "::")) exit 1
+			n = split(ip, groups, ":")
+			count = 0
+			for (i = 1; i <= n; i++) {
+				if (groups[i] == "") {
+					if (!compressed) exit 1
+					continue
+				}
+				if (length(groups[i]) > 4 || groups[i] !~ /^[[:xdigit:]]+$/) exit 1
+				count++
+			}
+			if (compressed ? count >= 8 : count != 8) exit 1
+		}'
+}
+
+valid_domain() {
+	local domain="$1"
+	case "$domain" in
+		\*.*) domain="${domain#*.}" ;;
+		*'*'*) return 1 ;;
+	esac
+	[ -n "$domain" ] && [ "${#domain}" -le 253 ] || return 1
+	printf '%s\n' "$domain" | awk -F. '
+		length($0) > 253 || NF == 0 { exit 1 }
+		{
+			for (i = 1; i <= NF; i++) {
+				if (length($i) == 0 || length($i) > 63 ||
+					$i !~ /^[A-Za-z0-9-]+$/ || $i ~ /^-/ || $i ~ /-$/) exit 1
+			}
+		}'
+}
+
+valid_route_target() {
+	case "$1" in
+		*/*)
+			case "$1" in *:*) valid_ipv6 "$1" ;; *) valid_cidr "$1" ;; esac ;;
+		*:*) valid_ipv6 "$1" ;;
+		*[!0-9.]* ) valid_domain "$1" ;;
+		*) valid_ip "$1" ;;
+	esac
 }
 
 # Записать вывод команды в FILE атомарно и только при успешном коде возврата.
@@ -158,6 +229,7 @@ settings_json() {
 		--arg user_agent "$(cfg user_agent "$VLESS_UA_DEFAULT")" --arg hwid "$(get_hwid)" \
 		--arg update_interval "$(cfg update_interval 24)" \
 		--arg selected "$(cfg selected auto)" \
+		--arg discord_mode "$(cfg discord_mode off)" --arg discord_offload "$(cfg discord_offload 1)" \
 		--arg auto_interval "$(cfg auto_interval 3m)" \
 		--arg auto_tolerance "$(cfg auto_tolerance 80)" \
 		--arg auto_test_url "$(cfg auto_test_url 'https://www.gstatic.com/generate_204')" \
@@ -166,6 +238,7 @@ settings_json() {
 		   mode:$mode, dns_mode:$dns_mode, remote_dns:$remote_dns, bootstrap_dns:$bootstrap_dns,
 		   kill_switch:($kill_switch=="1"), block_quic:($block_quic=="1"), block_ipv6:($block_ipv6=="1"), bypass_vpn:($bypass_vpn=="1"),
 		   bypass_ru:($bypass_ru=="1"), tun_stack:$tun_stack, mtu:(try ($mtu|tonumber) catch 1400), log_level:$log_level,
+		   discord_mode:$discord_mode, discord_offload:($discord_offload=="1"),
 		   user_agent:$user_agent, hwid:$hwid, update_interval:(try ($update_interval|tonumber) catch 24), selected:$selected,
 		   auto_interval:$auto_interval, auto_tolerance:(try ($auto_tolerance|tonumber) catch 80), auto_test_url:$auto_test_url,
 		   direct_domains:($dd|split(" ")|map(select(length>0))),
@@ -176,7 +249,8 @@ settings_json() {
 
 cmd_set() {
 	# stdin: JSON с настройками (только известные ключи)
-	local data k v t line bad rej="$RUN/set.rejected"
+	local data k v t line bad rej="$RUN/set.rejected" prev_dm
+	prev_dm="$(cfg discord_mode off)"
 	data="$(cat)"
 	: > "$rej"
 	printf '%s\n' "$data" | jq -e 'type=="object"' >/dev/null 2>&1 || { json_err "Некорректные настройки"; return 1; }
@@ -187,8 +261,8 @@ cmd_set() {
 		def b: if . == true then "1" elif . == false then "0" else . end;
 		[ "scope","mode","dns_mode","remote_dns","bootstrap_dns","kill_switch","block_quic","block_ipv6","bypass_ru","bypass_vpn",
 		  "tun_stack","mtu","log_level","user_agent","update_interval","selected",
-		  "auto_interval","auto_tolerance","auto_test_url" ] as $keys
-		| $keys[] as $k | select(has($k)) | "\($k)\t\(.[$k] | b | tostring)"' |
+		  "auto_interval","auto_tolerance","auto_test_url","discord_mode","discord_offload" ] as $keys
+		| $keys[] as $k | select(has($k)) | "\($k)\t\(.[$k] | b | tostring)"' | tr -d '\r' |
 	while IFS="$TAB" read -r k v; do
 		bad=0
 		case "$k" in
@@ -198,7 +272,8 @@ cmd_set() {
 			tun_stack)      case "$v" in system|gvisor|mixed) ;; *) bad=1 ;; esac ;;
 			log_level)      case "$v" in trace|debug|info|warn|error) ;; *) bad=1 ;; esac ;;
 			remote_dns|bootstrap_dns) valid_ip "$v" || bad=1 ;;
-			kill_switch|block_quic|block_ipv6|bypass_ru|bypass_vpn) case "$v" in 0|1) ;; *) bad=1 ;; esac ;;
+			kill_switch|block_quic|block_ipv6|bypass_ru|bypass_vpn|discord_offload) case "$v" in 0|1) ;; *) bad=1 ;; esac ;;
+			discord_mode)   case "$v" in off|auto|zapret|vpn) ;; *) bad=1 ;; esac ;;
 			mtu)            { echo "$v" | grep -qE '^[0-9]{4}$' && [ "$v" -ge 1000 ] && [ "$v" -le 9000 ]; } || bad=1 ;;
 			update_interval) { echo "$v" | grep -qE '^[0-9]{1,3}$' && [ "$v" -le 720 ]; } || bad=1 ;;
 			selected)       echo "$v" | grep -qE '^(auto|[0-9a-f]{8})$' || bad=1 ;;
@@ -224,13 +299,16 @@ cmd_set() {
 			echo "$k (значение с переводом строки)" >> "$rej"; continue
 		fi
 		: > "$RUN/list.ok"
-		printf '%s\n' "$data" | jq -r --arg k "$k" '.[$k][]? | tostring' | while IFS= read -r line; do
+		printf '%s\n' "$data" | jq -r --arg k "$k" '.[$k][]? | tostring' | tr -d '\r' | while IFS= read -r line; do
 			[ -n "$line" ] || continue
 			case "$k" in
 				devices)  valid_cidr "$line" || { echo "$k: $line" >> "$rej"; continue; } ;;
 				presets)  case " $PRESET_KEYS " in *" $line "*) ;; *) continue ;; esac ;;
 				ifaces)   echo "$line" | grep -qE '^[A-Za-z0-9_]{1,15}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
-				*)        echo "$line" | grep -qE '^[A-Za-z0-9.*/:_-]{1,100}$' || { echo "$k: $line" >> "$rej"; continue; } ;;
+				*)
+					[ "${#line}" -le 253 ] && valid_route_target "$line" ||
+						{ echo "$k: $line" >> "$rej"; continue; }
+					;;
 			esac
 			printf '%s\n' "$line" >> "$RUN/list.ok"
 		done
@@ -255,7 +333,65 @@ cmd_set() {
 		fi
 	fi
 	sync_cron
+	# Режим Discord сменился — подключаем или отключаем zapret (в фоне: может скачивать файлы)
+	if [ "$(cfg discord_mode off)" != "$prev_dm" ] && [ -x "$DISCORD_BIN" ] && [ -z "$DISCORD_NO_SERVICE" ]; then
+		( "$DISCORD_BIN" apply >/dev/null 2>&1 & )
+	fi
 	jq -n -c --rawfile r "$rej" '{ok:true, ignored:($r | split("\n") | map(select(length > 0)))}'
+}
+
+# ---------------------------------------------------------------- Discord через zapret
+# Обход Discord делает отдельный скрипт vless-discord (nfqws). Он решает, куда идёт Discord:
+#   zapret — напрямую, через nfqws: Discord вырезается из маршрутов VPN, чтобы не ходил через туннель;
+#   vpn    — через VPN (запасной путь, если ни одна стратегия zapret не подошла);
+#   off    — Discord не трогаем.
+# Здесь — только то, что касается самого VPN: «эффективные» настройки для sing-box.
+
+DISCORD_BIN="${VLESS_DISCORD_BIN:-/usr/bin/vless-discord}"
+
+discord_active() { cat "$RUN/discord.active" 2>/dev/null || echo off; }
+
+# effective_settings — настройки пользователя с поправкой на Discord.
+# Сохранённые настройки не меняются: поправка действует только при сборке маршрутов.
+#   zapret   → домены Discord идут напрямую (и в «всё», и в «выбранное»), UDP голоса — напрямую.
+#   vpn      → в режиме «выбранное» к пресетам добавляется Discord.
+#   vpn_only → VPN запущен только ради Discord (сам пользователь VPN не включал):
+#              «выбранное» с единственным пресетом, для всех устройств.
+effective_settings() {
+	local act only=false
+	act="$(discord_active)"
+	[ -f "$RUN/discord.vpn_only" ] && only=true
+	settings_json | jq -c --arg act "$act" --argjson only "$only" \
+		--argjson dom "$(jq -n -c -L "$LIB" 'include "presets"; presets.discord.domains')" '
+		if $only then (.scope = "selected" | .mode = "all" | .devices = [] | .presets = ["discord"] | .proxy_domains = [])
+		elif (.discord_mode // "off") == "off" then .
+		elif $act == "zapret" then
+			(.direct_domains = ((.direct_domains + $dom) | unique) | .presets = (.presets - ["discord"]) | .zapret_udp = true)
+		elif $act == "vpn" then (.presets = ((.presets + ["discord"]) | unique))
+		else . end'
+}
+eff() { effective_settings | jq -r --arg k "$1" '.[$k] | if type == "array" then join(" ") else tostring end'; }
+
+# discord-sync: vless-discord сообщает, что Discord перешёл на другой путь.
+# VPN работает — перечитываем маршруты; не работает, а Discord ушёл на VPN — поднимаем VPN
+# только ради Discord; Discord вернулся на zapret, а VPN поднимали мы — гасим.
+cmd_discord_sync() {
+	local act
+	act="$(discord_active)"
+	if is_running; then
+		if [ "$act" != vpn ] && [ -f "$RUN/discord.vpn_only" ]; then
+			rm -f "$RUN/discord.vpn_only"
+			/etc/init.d/vless stop >/dev/null 2>&1
+		else
+			/etc/init.d/vless restart >/dev/null 2>&1
+		fi
+		return 0
+	fi
+	if [ "$act" = vpn ] && [ "$(jq 'length' "$SERVERS" 2>/dev/null || echo 0)" -gt 0 ]; then
+		: > "$RUN/discord.vpn_only"
+		/etc/init.d/vless start >/dev/null 2>&1
+	fi
+	return 0
 }
 
 # cron_spec ЧАСЫ — до 23 ч: «каждые N часов»; больше: раз в N/24 дней в 04:17
@@ -575,25 +711,68 @@ cmd_update_all() {
 	return 0
 }
 
+remove_rollback() {
+	local tx="$1" f failed=0
+	for f in servers sources hidden; do
+		cp -p "$tx/$f" "$DIR/$f.json.rollback.$$" &&
+			mv "$DIR/$f.json.rollback.$$" "$DIR/$f.json" || failed=1
+	done
+	rm -rf "$tx"
+	if [ "$failed" = 1 ]; then
+		logger -t vless "ошибка: не удалось полностью отменить удаление серверов" 2>/dev/null
+		return 1
+	fi
+	return 0
+}
+
+remove_abort() {
+	local tx="$1" message="$2"
+	remove_rollback "$tx" || message="$message (не удалось полностью восстановить базу — проверьте файлы в $DIR)"
+	json_err "$message"
+	return 1
+}
+
 cmd_remove() { # remove ID (источник или одиночный сервер)
-	local id="$1" sel
+	local id="$1" sel tx="$RUN/remove.$$" ssrc f source_count server_count
 	echo "$id" | grep -qE '^[0-9a-z]{4,8}$' || { json_err "Некорректный id"; return 1; }
-	if [ "$(jq --arg id "$id" '[.[]|select(.id==$id)]|length' "$SOURCES")" != "0" ]; then
-		atomic_run "$SOURCES" jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES"
-		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.source != $id))' "$SERVERS"
+	source_count="$(jq --arg id "$id" '[.[]|select(.id==$id)]|length' "$SOURCES")" ||
+		{ json_err "Не удалось прочитать список подписок"; return 1; }
+	server_count="$(jq --arg id "$id" '[.[]|select(.id==$id)]|length' "$SERVERS")" ||
+		{ json_err "Не удалось прочитать список серверов"; return 1; }
+	[ "$source_count" != "0" ] || [ "$server_count" != "0" ] ||
+		{ json_err "Сервер или подписка не найдены"; return 1; }
+	mkdir "$tx" 2>/dev/null || { json_err "Не удалось подготовить удаление"; return 1; }
+	for f in servers sources hidden; do
+		cp -p "$DIR/$f.json" "$tx/$f" 2>/dev/null || {
+			rm -rf "$tx"
+			json_err "Не удалось подготовить резервную копию базы серверов"
+			return 1
+		}
+	done
+	if [ "$source_count" != "0" ]; then
+		atomic_run "$SOURCES" jq -c --arg id "$id" 'map(select(.id != $id))' "$SOURCES" ||
+			{ remove_abort "$tx" "Не удалось сохранить список подписок"; return 1; }
+		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.source != $id))' "$SERVERS" ||
+			{ remove_abort "$tx" "Не удалось сохранить список серверов"; return 1; }
 		# вместе с подпиской забываем и список удалённых из неё серверов
-		atomic_run "$HIDDEN" jq -c --arg id "$id" 'map(select(.source != $id))' "$HIDDEN"
+		atomic_run "$HIDDEN" jq -c --arg id "$id" 'map(select(.source != $id))' "$HIDDEN" ||
+			{ remove_abort "$tx" "Не удалось сохранить список исключённых серверов"; return 1; }
 	else
 		# удалённый сервер подписки запоминаем, чтобы он не вернулся при обновлении
-		local ssrc; ssrc="$(jq -r --arg id "$id" '[.[]|select(.id==$id)][0].source // empty' "$SERVERS")"
+		ssrc="$(jq -r --arg id "$id" '[.[]|select(.id==$id)][0].source // empty' "$SERVERS")" ||
+			{ remove_abort "$tx" "Не удалось прочитать источник сервера"; return 1; }
 		if [ -n "$ssrc" ] && [ "$ssrc" != "manual" ]; then
-			atomic_run "$HIDDEN" jq -c --arg id "$id" --arg src "$ssrc" '(map(select(.id != $id)) + [{id:$id,source:$src}])' "$HIDDEN"
+			atomic_run "$HIDDEN" jq -c --arg id "$id" --arg src "$ssrc" '(map(select(.id != $id)) + [{id:$id,source:$src}])' "$HIDDEN" ||
+				{ remove_abort "$tx" "Не удалось сохранить список исключённых серверов"; return 1; }
 		fi
-		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.id != $id))' "$SERVERS"
+		atomic_run "$SERVERS" jq -c --arg id "$id" 'map(select(.id != $id))' "$SERVERS" ||
+			{ remove_abort "$tx" "Не удалось сохранить список серверов"; return 1; }
 		# обновить счётчик «Мои ключи»
 		atomic_run "$SOURCES" jq -c --argjson n "$(jq '[.[]|select(.source=="manual")]|length' "$SERVERS")" \
-			'map(if .id=="manual" then .count=$n else . end) | map(select(.id!="manual" or .count>0))' "$SOURCES"
+			'map(if .id=="manual" then .count=$n else . end) | map(select(.id!="manual" or .count>0))' "$SOURCES" ||
+			{ remove_abort "$tx" "Не удалось обновить список источников"; return 1; }
 	fi
+	rm -rf "$tx"
 	sel="$(cfg selected auto)"
 	if [ "$sel" != "auto" ] && [ "$(jq --arg s "$sel" '[.[]|select(.id==$s)]|length' "$SERVERS")" = "0" ]; then
 		uci set vless.main.selected=auto; uci commit vless
@@ -666,7 +845,7 @@ cmd_prepare() {
 	[ -c /dev/net/tun ] || { set_error "Нет устройства /dev/net/tun. Установите: opkg install kmod-tun"; return 1; }
 	secret="$(cat /proc/sys/kernel/random/uuid)"
 	printf '%s' "$secret" > "$RUN/secret"; chmod 600 "$RUN/secret"
-	if ! out="$(jq -n -L "$LIB" -f "$LIB/build.jq" --slurpfile servers "$SERVERS" --argjson s "$(settings_json)" \
+	if ! out="$(jq -n -L "$LIB" -f "$LIB/build.jq" --slurpfile servers "$SERVERS" --argjson s "$(effective_settings)" \
 			--arg secret "$secret" --arg selected "$(cfg selected auto)" --arg logfile "$RUN/sing-box.log" 2>&1 > "$CONFIG.tmp")"; then
 		set_error "$(echo "$out" | head -n3 | tr '\n' ' ')"; rm -f "$CONFIG.tmp"; return 1
 	fi
@@ -686,6 +865,7 @@ cmd_prepare() {
 # Готовность туннеля интерфейс узнаёт сам, опрашивая status.
 cmd_connect() {
 	local i=0
+	rm -f "$RUN/discord.vpn_only"   # пользователь включил VPN сам — это уже полноценный VPN
 	: > "$RUN/last_error"
 	# Старый экземпляр должен освободить vless0 до старта нового. procd не ждёт
 	# полного завершения, поэтому новый sing-box не мог создать туннель, подключение
@@ -710,6 +890,7 @@ cmd_connect() {
 }
 
 cmd_disconnect() {
+	rm -f "$RUN/discord.vpn_only"
 	/etc/init.d/vless stop >/dev/null 2>&1
 	# Журнал прошлой сессии убираем в сторону и начинаем чистый. Иначе ошибки,
 	# случившиеся во время работы, всплывают потом как «Ошибка подключения»
@@ -815,8 +996,8 @@ SEL_SET="vpn4"
 # selective_lists — строки «D домен» и «C подсеть» для выбранных пресетов и своих сайтов
 selective_lists() {
 	local keys pd
-	keys="$(uci -q get vless.main.presets 2>/dev/null | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')"
-	pd="$(uci -q get vless.main.proxy_domains 2>/dev/null | tr ' ' '\n' | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+	keys="$(effective_settings | jq -c '.presets // []')"
+	pd="$(effective_settings | jq -c '.proxy_domains // []')"
 	jq -n -r -L "$LIB" --argjson keys "$keys" --argjson pd "$pd" '
 		include "presets";
 		def isdigits: length > 0 and (explode | all(. >= 48 and . <= 57));
@@ -840,7 +1021,7 @@ selective_nft_conf() {
 	for d in $(uci -q get vless.main.devices 2>/dev/null); do
 		valid_cidr "$d" && csv="${csv:+$csv, }$d"
 	done
-		case "$(cfg mode all)" in
+		case "$(eff mode)" in
 			include)
 				if [ -n "$csv" ]; then rule="ip saddr { $csv } ip daddr @$SEL_SET meta mark set $SEL_MARK"; else rule=""; fi ;;
 			exclude)
@@ -931,9 +1112,14 @@ net_up() {
 
 	# выборочный режим: метим только пакеты к адресам набора vpn4; при неудаче — обычный режим
 	local sel=0
-	if [ "$(cfg scope all)" = selected ] && selective_up; then
-		sel=1
-		ip rule add fwmark $SEL_MARK lookup $TABLE pref 9100 2>/dev/null && note_pref 9100
+	if [ "$(eff scope)" = selected ]; then
+		if selective_up; then
+			sel=1
+			ip rule add fwmark $SEL_MARK lookup $TABLE pref 9100 2>/dev/null && note_pref 9100
+		elif [ -f "$RUN/discord.vpn_only" ]; then
+			# Без выборочного режима «VPN только для Discord» превратился бы в VPN для всего.
+			net_fail "Для запасного пути Discord через VPN нужен dnsmasq-full (поддержка nftset)"
+		fi
 	fi
 
 	ifs="$(uci -q get vless.main.ifaces 2>/dev/null)"; [ -n "$ifs" ] || ifs="lan"
@@ -1089,7 +1275,7 @@ PING_URL="https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
 ping_all_servers() { # -> {"id":мс,…}
 	local ids id d p n=0 pids="" dir="$RUN/delay.$$" f
 	rm -rf "$dir"; mkdir -p "$dir"
-	ids="$(jq -r '.[] | select(.supported==true and .outbound!=null) | .id' "$SERVERS" 2>/dev/null)"
+	ids="$(jq -r '.[] | select(.supported==true and .outbound!=null) | .id' "$SERVERS" 2>/dev/null | tr -d '\r')"
 	if [ -z "$ids" ]; then echo '{}'; return 0; fi
 	for id in $ids; do
 		(
@@ -1196,7 +1382,7 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 		return 0
 	fi
 	# параллельный пинг всех серверов (через файлы: <(...) не работает в sh)
-	jq -r '.[]|[.id,.server,(.port|tostring)]|@tsv' "$SERVERS" 2>/dev/null > "$RUN/pingtab"
+	jq -r '.[]|[.id,.server,(.port|tostring)]|@tsv' "$SERVERS" 2>/dev/null | tr -d '\r' > "$RUN/pingtab"
 	local result="{}" n=0 p
 	pids=""
 	while IFS="$TAB" read -r id host port; do
@@ -1271,10 +1457,11 @@ cmd_state() {
 		--argjson settings "$(settings_json)" \
 		--argjson status "$(cmd_status)" \
 		--argjson delays "$delays" \
+		--argjson discord "$(d="$("$DISCORD_BIN" status 2>/dev/null)"; printf '%s' "$d" | jq -e 'type=="object"' >/dev/null 2>&1 && printf '%s' "$d" || echo null)" \
 		--arg version "$(sb_version)" \
 		--argjson autostart "$(autostart_on && echo true || echo false)" \
 		--argjson tun "$([ -c /dev/net/tun ] && echo true || echo false)" \
-		'{servers:$servers,sources:$sources,settings:($settings + {autostart:$autostart}),status:$status,delays:$delays,singbox:$version,tun:$tun}'
+		'{servers:$servers,sources:$sources,settings:($settings + {autostart:$autostart}),status:$status,delays:$delays,discord:$discord,singbox:$version,tun:$tun}'
 }
 
 cmd_devices() {
@@ -1353,6 +1540,8 @@ case "$1" in
 	selective-lists) selective_lists ;;
 	selective-nft)   selective_nft_conf ;;
 	sync-cron)  sync_cron ;;
+	discord-sync) locked cmd_discord_sync ;;
+	effective)  effective_settings ;;
 	settings)   settings_json ;;
 	selftest)   cmd_selftest ;;
 	*)

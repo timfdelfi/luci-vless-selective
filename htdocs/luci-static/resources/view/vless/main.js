@@ -29,6 +29,8 @@ var rDevices    = H('devices');
 var rLogs       = H('logs');
 var rClear      = H('clear');
 var rClearLog   = H('clearlog');
+var rDiscordStatus = H('discord-status');
+var rDiscordRun    = H('discord-run', ['action']);
 
 /* Ретраи для сетевых запросов с экспоненциальной задержкой */
 var MAX_RETRIES = 3;
@@ -214,6 +216,11 @@ var CSS = [
 '.hv-opt.col{display:block}',
 '.hv-opt.col .c{width:auto;margin-top:7px}',
 '.hv-hint{font-size:12px;color:var(--tx2);margin-top:7px;line-height:1.5}',
+'.hv-dc{margin-top:10px;border:1px solid var(--line);border-radius:var(--r);padding:10px 12px;font-size:13px;min-width:0}',
+'.hv-dc .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}',
+'.hv-dc .row span{color:var(--tx2);flex:none}.hv-dc .row b{font-weight:550;text-align:right;word-break:break-word;min-width:0}',
+'.hv-dc .row b.ok{color:var(--ok)}.hv-dc .row b.bad{color:var(--bad)}.hv-dc .row b.warn{color:var(--warn)}',
+'.hv-dc .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}',
 '.hv-sw{position:relative;width:40px;height:22px;flex:none;display:block;cursor:pointer}',
 '.hv-sw input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer;z-index:1;width:100%;height:100%}',
 '.hv-sw i{position:absolute;inset:0;border-radius:22px;background:var(--line);transition:.15s;display:block}',
@@ -1221,6 +1228,7 @@ return view.extend({
 		this.drawList();
 		this.updatePower();
 		this.drawBanners();
+		this.drawDiscord();
 		this.foot.textContent = [this.S.singbox ? 'sing-box ' + this.S.singbox : '', this.S.tun ? 'TUN' : ''].filter(Boolean).join(' · ');
 		if (this.phase() === 'on' && !this.check) this.doCheck();
 		if (this.phase() === 'on' && !this.pinged && this.servers().length) this.doPing();
@@ -1241,6 +1249,13 @@ return view.extend({
 				E('button', { type: 'button', 'class': 'hv-btn ghost sm', click: function () { self.refreshAll(); } }, 'Повторить'));
 		if (S.tun === false)
 			add('bad', 'Модуль TUN не найден', 'Установите пакет kmod-tun и перезагрузите роутер.');
+		var dc = S.discord;
+		if (dc && dc.conflict)
+			add('warn', 'Discord: найден другой zapret', 'Уже работает другой nfqws (отдельная установка zapret). Два обработчика на один трафик мешают друг другу — отключите один из них.');
+		else if (dc && dc.mode === 'auto' && dc.active === 'vpn')
+			add('warn', 'Discord идёт через VPN', (dc.reason || 'Обход через zapret не подошёл.') + ' Раз в несколько часов я пробую вернуться на zapret.');
+		else if (dc && (dc.mode === 'zapret' || dc.mode === 'auto') && dc.active === 'error')
+			add('bad', 'Discord не работает', dc.reason || 'Обход через zapret не удался.');
 		if (st.other_singbox && !st.connected && this.phase() !== 'busy')
 			add('warn', 'Запущен другой sing-box', 'Похоже, работает Podkop или другой VPN на sing-box. Остановите его перед подключением — два VPN одновременно мешают друг другу.');
 	},
@@ -1335,6 +1350,7 @@ return view.extend({
 		var routeNow = s.scope === 'selected' ? 'selected' : (s.bypass_ru ? 'no_ru' : 'all');
 		var presetBox = E('div', { style: 'margin-top:12px' });
 		var routeHint = E('div', { 'class': 'hv-hint' });
+		this.dcBox = E('div', { 'class': 'hv-dc' });
 		var hints = {
 			all: 'Весь трафик устройств идёт через VPN.',
 			no_ru: '.ru, .рф и популярные российские сервисы идут напрямую, остальное — через VPN.',
@@ -1409,6 +1425,12 @@ return view.extend({
 				E('div', { 'class': 'hv-label' }, ['Свои исключения', E('span', {}, 'Домены или подсети, которые всегда идут напрямую')]),
 				area('direct_domains', s.direct_domains, 'example.com\nbank.ru\n203.0.113.0/24')
 			]),
+			section('zap', 'Discord', 'Отдельный обход только для Discord: через zapret — быстрее и без нагрузки на VPN, а если не сработает — через VPN.', [
+				optRow('Как пускать Discord', 'Голос и демонстрация экрана тоже идут этим путём', select('discord_mode', [['off', 'Не трогать'], ['auto', 'zapret, при сбое — VPN'], ['zapret', 'Только zapret'], ['vpn', 'Только VPN']], s.discord_mode || 'off'), true, true),
+				toggleRow('discord_offload', 'Отключить flow offloading', 'zapret не работает с ним: роутер перестаёт ускорять соединения в обход процессора. Прежнее значение вернётся при выключении обхода', s.discord_offload !== false),
+				this.dcBox,
+				E('div', { 'class': 'hv-hint' }, 'Нужны пакеты kmod-nft-queue и kmod-nfnetlink-queue — модуль поставит их сам. Файлы скачиваются с GitHub и проверяются по контрольной сумме.')
+			]),
 			section('laptop', 'Для каких устройств', 'По умолчанию VPN работает для всех, кто подключён к роутеру.', [F.mode.el, devWrap])
 		]);
 
@@ -1436,6 +1458,7 @@ return view.extend({
 		]);
 
 		this.paneSet.appendChild(E('div', { 'class': 'hv-set' }, [left, right]));
+		this.drawDiscord();
 
 		this.paneSet.appendChild(E('div', { 'class': 'hv-card hv-danger' }, [
 			E('div', { 'class': 't' }, [E('b', {}, 'Сбросить серверы'), E('span', {}, 'Удалит все подписки и ключи и остановит VPN. Настройки сохранятся.')]),
@@ -1511,8 +1534,11 @@ return view.extend({
 			autostart: F.autostart.get(),
 			auto_interval: F.auto_interval.get(),
 			auto_tolerance: tolerance,
-			auto_test_url: testUrl
+			auto_test_url: testUrl,
+			discord_mode: F.discord_mode.get(),
+			discord_offload: F.discord_offload.get()
 		};
+		var prevDiscord = (this.S.settings || {}).discord_mode || 'off';
 		btn.disabled = true;
 		withRetry(function () { return rSet(settings); }).then(function (r) {
 			if (!r || !r.ok) { btn.disabled = false; self.toast((r && r.error) || 'Не удалось сохранить', true); return; }
@@ -1525,7 +1551,86 @@ return view.extend({
 			} else self.toast(running ? 'Сохранено — перезапускаю VPN…' : 'Сохранено');
 			if (running) self.connect();
 			self.refreshAll();
+			/* модуль Discord применяет настройки в фоне (может скачивать файлы) — следим за ходом */
+			if (settings.discord_mode !== prevDiscord) self.startDiscordPoll();
 		}).catch(function () { btn.disabled = false; self.toast('Не удалось сохранить: роутер не ответил', true); });
+	},
+
+	/* ───── Discord (zapret) ───── */
+
+	drawDiscord: function () {
+		var self = this, box = this.dcBox, d = this.S && this.S.discord;
+		if (!box) return;
+		box.innerHTML = '';
+		if (!d) {
+			box.appendChild(E('div', { 'class': 'hv-hint' }, 'Состояние модуля недоступно. Выполните на роутере: vless-discord selftest'));
+			return;
+		}
+		var row = function (k, v, cls) { return E('div', { 'class': 'row' }, [E('span', {}, k), E('b', { 'class': cls || '' }, v)]); };
+		var ago = function (ts) {
+			if (!ts || !d.now) return '—';
+			var m = Math.max(0, Math.round((d.now - ts) / 60));
+			return m < 1 ? 'только что' : m < 60 ? m + ' мин назад' : Math.round(m / 60) + ' ч назад';
+		};
+		var path = { zapret: ['через zapret', 'ok'], vpn: ['через VPN', 'warn'], off: ['не обрабатывается', ''], error: ['не работает', 'bad'] }[d.active] || [d.active, ''];
+		box.appendChild(row('Discord сейчас', path[0], path[1]));
+		if (d.mode === 'auto' || d.mode === 'zapret') {
+			box.appendChild(row('zapret', d.installed ? (d.running ? 'работает' : 'остановлен') : 'не установлен', d.installed && d.running ? 'ok' : (d.installed ? 'warn' : '')));
+			if (d.strategy_name && d.active === 'zapret') box.appendChild(row('Стратегия', d.strategy + ' — ' + d.strategy_name));
+			if (d.strategies) box.appendChild(row('Стратегий в наборе', String(d.strategies)));
+			box.appendChild(row('Последняя проверка', ago(d.last_check)));
+			if (d.zapret || d.flowseal) box.appendChild(row('Версии', [d.zapret ? 'nfqws ' + d.zapret : '', d.flowseal ? 'Flowseal ' + d.flowseal : ''].filter(Boolean).join(' · ')));
+			if (d.results && d.results.length) {
+				var tried = d.results.filter(function (r) { return !r.skipped; });
+				box.appendChild(row('Перебрано стратегий', tried.length + (tried.some(function (r) { return r.ok; }) ? ' (подошла последняя)' : ' (ни одна не подошла)')));
+			}
+			if (d.offload_disabled) box.appendChild(row('Flow offloading', 'отключён скриптом', 'warn'));
+		}
+		if (d.mode === 'auto' && d.vpn_servers === 0)
+			box.appendChild(E('div', { 'class': 'hv-hint' }, 'Запасной путь через VPN не заработает: добавьте сервер на вкладке «Подключение».'));
+		if (d.reason) box.appendChild(E('div', { 'class': 'hv-hint' }, d.reason));
+		if (d.busy) box.appendChild(E('div', { 'class': 'hv-hint' }, 'Выполняется: ' + d.busy + '…'));
+
+		var acts = E('div', { 'class': 'acts' });
+		var btn = function (label, action, ghost) {
+			var b = E('button', { type: 'button', 'class': 'hv-btn sm' + (ghost ? ' ghost' : ''), click: function () { self.discordRun(action); } }, label);
+			if (d.busy) b.disabled = true;
+			acts.appendChild(b);
+		};
+		if (d.mode === 'auto' || d.mode === 'zapret') {
+			btn('Проверить сейчас', 'auto');
+			if (!d.installed) btn('Установить zapret', 'install', true);
+			else btn('Обновить стратегии', 'update', true);
+		}
+		if (acts.childNodes.length) box.appendChild(acts);
+		if (this._dirty) box.appendChild(E('div', { 'class': 'hv-hint' }, 'Есть несохранённые изменения — кнопки действуют по сохранённым настройкам.'));
+	},
+
+	discordRun: function (action) {
+		var self = this;
+		rDiscordRun(action).then(function (r) {
+			if (!r || !r.ok) { self.toast((r && r.error) || 'Не удалось запустить', true); return; }
+			self.toast('Запущено — это может занять несколько минут');
+			self.startDiscordPoll();
+		}).catch(function () { self.toast('Роутер не ответил', true); });
+	},
+
+	/* пока модуль занят (установка, перебор стратегий) — спрашиваем его состояние каждые 2 секунды */
+	startDiscordPoll: function () {
+		var self = this, n = 0;
+		if (this._dcPoll) return;
+		this._dcPoll = setInterval(function () {
+			n++;
+			if (!document.body.contains(self.root) || n > 300) { clearInterval(self._dcPoll); self._dcPoll = null; return; }
+			rDiscordStatus().then(function (d) {
+				if (!d || typeof d !== 'object') return;
+				self.S.discord = d;
+				self.drawDiscord();
+				self.drawBanners();
+				/* первые секунды после сохранения модуль ещё не успел взять «занято» */
+				if (!d.busy && n >= 3) { clearInterval(self._dcPoll); self._dcPoll = null; self.refreshAll(); }
+			}).catch(function () {});
+		}, 2000);
 	},
 
 	resetAll: function () {

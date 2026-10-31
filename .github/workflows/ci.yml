@@ -31,14 +31,14 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          files="$(git ls-files '*.sh') $(git ls-files root/usr/bin/vless root/etc/init.d/vless root/usr/libexec/rpcd/vless root/etc/uci-defaults/'*' tests/mock/*)"
+          files="$(git ls-files '*.sh') $(git ls-files root/usr/bin/vless root/usr/bin/vless-discord root/etc/init.d/vless root/etc/init.d/vless-discord root/usr/libexec/rpcd/vless root/etc/uci-defaults/'*' tests/mock/*)"
           echo "$files"
           shellcheck -s sh -S warning -e SC3043,SC2034 $files
 
       - name: sh -n (синтаксис всех скриптов)
         run: |
           for f in $(git ls-files '*.sh' | grep -v '\.bat$'); do sh -n "$f" || exit 1; done
-          for f in root/usr/bin/vless root/etc/init.d/vless root/usr/libexec/rpcd/vless tests/mock/uci tests/mock/api/curl; do
+          for f in root/usr/bin/vless root/usr/bin/vless-discord root/etc/init.d/vless root/etc/init.d/vless-discord root/usr/libexec/rpcd/vless tests/mock/uci tests/mock/api/curl; do
             sh -n "$f" || exit 1
           done
 
@@ -127,7 +127,7 @@ jobs:
         run: |
           cd dist && rm -rf _x && mkdir _x && cd _x
           tar xzf ../data.tar.gz
-          for f in ./usr/bin/vless ./usr/libexec/rpcd/vless ./etc/init.d/vless; do
+          for f in ./usr/bin/vless ./usr/bin/vless-discord ./usr/libexec/rpcd/vless ./etc/init.d/vless ./etc/init.d/vless-discord; do
             [ -x "$f" ] || { echo "НЕ исполняемый: $f"; exit 1; }
           done
           echo "ok: права 0755 на месте"
@@ -158,7 +158,7 @@ jobs:
       - name: Проверить, что тег совпадает с VERSION
         run: |
           VER="$(cat VERSION)"
-          [ "v$VER" = "${{ github.ref_name }}" ] || { echo "Тег ${{ github.ref_name }} не совпадает с VERSION=$VER"; exit 1; }
+          [ "v$VER" = "${{ github.ref_name }}" ] || [ "v${VER%%-*}" = "${{ github.ref_name }}" ] || { echo "Тег ${{ github.ref_name }} не совпадает с VERSION=$VER"; exit 1; }
 
       - name: Собрать
         run: sh build.sh
