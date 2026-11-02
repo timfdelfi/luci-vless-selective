@@ -76,6 +76,8 @@ missing=""
 for f in /usr/bin/vless /usr/bin/vless-discord /usr/libexec/rpcd/vless /etc/init.d/vless /etc/init.d/vless-discord \
 	/usr/share/vless/discord-strategies.conf \
 	/usr/share/vless/parse.jq /usr/share/vless/build.jq /usr/share/vless/presets.jq \
+	/usr/share/vless/lib/util.sh /usr/share/vless/lib/validate.sh /usr/share/vless/lib/settings.sh /usr/share/vless/lib/discord.sh /usr/share/vless/lib/cron.sh /usr/share/vless/lib/subscriptions.sh \
+	/usr/share/vless/lib/lifecycle.sh /usr/share/vless/lib/net.sh /usr/share/vless/lib/selective.sh /usr/share/vless/lib/probe.sh /usr/share/vless/lib/status.sh \
 	/usr/share/rpcd/acl.d/luci-vless-selective.json; do
 	[ -s "$f" ] || missing="$missing $f"
 done

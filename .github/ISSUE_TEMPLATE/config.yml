@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Документация и README
+    url: https://github.com/timfdelfi/luci-vless-selective#readme
+    about: Сначала загляните в раздел «Если что-то не работает».

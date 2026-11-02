@@ -44,7 +44,7 @@ jobs:
 
       # jq на роутерах часто собран без Oniguruma, поэтому проверяем компилируемость
       # и то, что скрипты не используют регулярные выражения.
-      - name: jq: компилируемость и отсутствие регулярных выражений
+      - name: "jq: компилируемость и отсутствие регулярных выражений"
         run: sh ci/check-jq.sh
 
       - name: Проверить переводы строк (LF)
@@ -52,6 +52,12 @@ jobs:
 
       - name: node --check для интерфейса
         run: node --check htdocs/luci-static/resources/view/vless/main.js
+
+      - name: Модули бэкенда (состав, диспетчер, дубли функций)
+        run: sh tests/modules.sh
+
+      - name: Заглушки не разошлись с кодом
+        run: sh tests/mock-drift.sh
 
   test:
     name: Тесты
@@ -103,11 +109,32 @@ jobs:
           path: tests/ui/out/
           if-no-files-found: ignore
 
+  minify:
+    name: Размер и минификация интерфейса
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Релиз по умолчанию не минифицируется. Этот шаг следит, что main.js укладывается в бюджет
+      # размера, а минификация не ломает LuCI-директивы ('require …'), чтобы включить её (MINIFY=1) было безопасно.
+      - name: Бюджет размера и пробная минификация
+        run: sh ci/minify-js.sh dist/main.min.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-min-js
+          path: dist/main.min.js
+
   package:
     name: Сборка пакетов
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [lint, test, ui]
+    needs: [lint, test, ui, minify]
     steps:
       - uses: actions/checkout@v4
 
@@ -126,7 +153,8 @@ jobs:
       - name: Проверить, что скрипты в пакете исполняемые
         run: |
           cd dist && rm -rf _x && mkdir _x && cd _x
-          tar xzf ../data.tar.gz
+          ar x ../luci-vless-selective_$(cat ../../VERSION)_all.ipk data.tar.gz
+          tar xzf data.tar.gz
           for f in ./usr/bin/vless ./usr/bin/vless-discord ./usr/libexec/rpcd/vless ./etc/init.d/vless ./etc/init.d/vless-discord; do
             [ -x "$f" ] || { echo "НЕ исполняемый: $f"; exit 1; }
           done

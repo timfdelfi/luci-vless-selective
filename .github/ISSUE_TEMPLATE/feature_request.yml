@@ -1,0 +1,25 @@
+name: Предложить улучшение
+description: Новая возможность, протокол, пресет или удобство в интерфейсе
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу вы решаете
+      description: "Опишите ситуацию, а не готовое решение: что сейчас неудобно или невозможно."
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы работать
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Чем обходитесь сейчас
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Участие
+      options:
+        - label: Готов сделать pull request (см. CONTRIBUTING.md)

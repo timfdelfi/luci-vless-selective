@@ -1,6 +1,7 @@
 #!/bin/sh
 # Сборка установочных пакетов без OpenWrt SDK.
 #   sh build.sh   ->   dist/vless-vpn.zip (Windows), dist/vless-vpn.tar.gz и dist/luci-vless-selective_<версия>_all.ipk
+#   MINIFY=1 sh build.sh   то же, но main.js минифицируется (нужны node и сеть для terser; см. ci/minify-js.sh)
 set -e
 cd "$(dirname "$0")"
 VER="$(tr -d '\r\n' < VERSION)"
@@ -11,11 +12,19 @@ printf '%s\n' "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' || {
 OUT="$PWD/dist"; W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT
 mkdir -p "$OUT"
+# Каталог интерфейса, который попадёт в пакеты: по умолчанию исходный, с MINIFY=1 — с минифицированным main.js.
+HT="$PWD/htdocs"
+if [ "${MINIFY:-0}" = 1 ]; then
+	cp -a htdocs "$W/htdocs"
+	sh ci/minify-js.sh "$W/htdocs/luci-static/resources/view/vless/main.js"
+	HT="$W/htdocs"
+fi
 rm -f "$OUT/vless-vpn.tar.gz" "$OUT/vless-vpn.zip" "$OUT/luci-vless-selective_${VER}_all.ipk"
 
 # 1) универсальный установщик (opkg и apk)
 mkdir -p "$W/vless-vpn"
-cp -a root htdocs install.sh uninstall.sh INSTALL.bat "$W/vless-vpn/"
+cp -a root install.sh uninstall.sh INSTALL.bat "$W/vless-vpn/"
+cp -a "$HT" "$W/vless-vpn/htdocs"
 chmod 0755 "$W/vless-vpn/root/usr/bin/vless" "$W/vless-vpn/root/usr/bin/vless-discord" "$W/vless-vpn/root/usr/libexec/rpcd/vless" \
 	"$W/vless-vpn/root/etc/init.d/vless" "$W/vless-vpn/root/etc/init.d/vless-discord" "$W/vless-vpn/root/etc/uci-defaults/90-vless" \
 	"$W/vless-vpn/install.sh" "$W/vless-vpn/uninstall.sh"
@@ -36,7 +45,7 @@ if command -v ar >/dev/null 2>&1; then
 	cp -a root/. "$W/data/"
 	chmod 0755 "$W/data/usr/bin/vless" "$W/data/usr/bin/vless-discord" "$W/data/usr/libexec/rpcd/vless" \
 		"$W/data/etc/init.d/vless" "$W/data/etc/init.d/vless-discord" "$W/data/etc/uci-defaults/90-vless"
-	cp -a htdocs/. "$W/data/www/"
+	cp -a "$HT"/. "$W/data/www/"
 	find "$W/data" "$W/ctl" -type f -exec sed -i 's/\r$//' {} +
 	cat > "$W/ctl/control" <<C
 Package: luci-vless-selective

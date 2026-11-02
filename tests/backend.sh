@@ -1,8 +1,10 @@
 #!/bin/sh
-# Тесты бэкенда (/usr/bin/vless) на заглушках: без роутера, sing-box и сети.
+# Тесты бэкенда (/usr/bin/vless и lib/*.sh) на заглушках: без роутера, sing-box и сети.
 #   sh tests/backend.sh
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
+# Исходники бэкенда: главный скрипт и модули lib/*.sh (функции достаём sed'ом из всех сразу).
+VSRC="root/usr/bin/vless $(ls root/usr/share/vless/lib/*.sh | tr '\n' ' ')"
 fail=0
 ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n' "$1"; fail=1; }
@@ -133,7 +135,7 @@ t "подписка недоступна: понятная ошибка" "$r" '.
 echo "== подписка в base64 (Xray-JSON)"
 # Раньше формат определялся ДО декодирования, поэтому base64(Xray-JSON)
 # уходил в режим links и пользователь получал «серверов не найдено».
-eval "$(sed -n '/^b64dec()/,/^}/p;/^body_format()/,/^}/p;/^body_to_tsv()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^b64dec()/,/^}/p;/^body_format()/,/^}/p;/^body_to_tsv()/,/^}/p' $VSRC)"
 # Анализатор считает LIB неиспользуемой, но она нужна функции body_to_tsv,
 # которая подтягивается eval'ом — такие строки статический анализ не разбирает.
 RUN="$VLESS_RUN"; LIB="$VLESS_LIB"; mkdir -p "$RUN"
@@ -149,10 +151,10 @@ printf '%s\n' "$(body_to_tsv "$W/sub.json" 2>/dev/null)" | cut -f2 | jq -e '.out
 echo "== замер пинга при подключённом VPN"
 # В Clash API sing-box 1.12+ нет маршрута /group/... — прежний код стучался туда
 # и всегда получал ошибку, поэтому пинг не появлялся. Меряем /proxies/s-<id>/delay сами.
-grep -qE "api GET '?/group/" root/usr/bin/vless && bad "в коде остался несуществующий запрос /group/" \
+grep -qE "api GET '?/group/" $VSRC && bad "в коде остался несуществующий запрос /group/" \
 	|| ok "запросов к несуществующему /group/ больше нет"
 SERVERS="$VLESS_DIR/servers.json"; RUN="$VLESS_RUN"
-eval "$(sed -n '/^api()/,/^}/p;/^ping_all_servers()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^api()/,/^}/p;/^ping_all_servers()/,/^}/p' $VSRC)"
 [ -f "$SERVERS" ] && cp "$SERVERS" "$SERVERS.ping.bak"
 printf '%s\n' aaaaaaa1 aaaaaaa2 dead0001 aaaaaaa3 aaaaaaa4 |
 	jq -R -s 'split("\n") | map(select(length > 0))
@@ -176,7 +178,7 @@ echo "== шум в журнале не должен показываться к�
 printf '%s\n' "+0000 ERROR [1 55.63s] connection: connection download closed: http2: client connection force closed via ClientConn.Close" \
 	> "$RUN/sing-box.log"
 printf '%s\n' "+0000 INFO inbound/tun[tun-in]: started at vless0" >> "$RUN/sing-box.log"
-eval "$(sed -n '/^log_noise()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^log_noise()/,/^}/p' $VSRC)"
 err="$(grep -iE 'fatal|error' "$RUN/sing-box.log" | log_noise)"
 [ -z "$err" ] && ok "обрыв соединения отфильтрован" || bad "шум не отфильтрован: $err"
 

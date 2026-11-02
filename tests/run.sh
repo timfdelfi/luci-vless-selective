@@ -3,6 +3,8 @@
 #   sh tests/run.sh
 cd "$(dirname "$0")/.." || exit 1
 LIB=root/usr/share/vless
+# Исходники бэкенда: главный скрипт и модули lib/*.sh (функции достаём sed'ом из всех сразу).
+VSRC="root/usr/bin/vless $(ls root/usr/share/vless/lib/*.sh | tr '\n' ' ')"
 fail=0
 ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n' "$1"; fail=1; }
@@ -68,7 +70,7 @@ cj "QUIC режется после правил «напрямую»"       '([.
 cj "reject-правило QUIC присутствует"           '[.route.rules[]|select(.action=="reject" and .port==443)]|length==1'
 
 echo "== функции бэкенда"
-eval "$(sed -n '/^valid_ip()/,/^}/p;/^valid_cidr()/,/^}/p;/^valid_ipv6()/,/^}/p;/^valid_domain()/,/^}/p;/^valid_route_target()/,/^}/p;/^cron_spec()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^valid_ip()/,/^}/p;/^valid_cidr()/,/^}/p;/^valid_ipv6()/,/^}/p;/^valid_domain()/,/^}/p;/^valid_route_target()/,/^}/p;/^cron_spec()/,/^}/p' $VSRC)"
 valid_ip 192.168.1.1 && ok "valid_ip: 192.168.1.1" || bad "valid_ip: 192.168.1.1"
 valid_ip 999.1.1.1 && bad "valid_ip: 999.1.1.1 отклонён" || ok "valid_ip: 999.1.1.1 отклонён"
 valid_ip 1.2.3 && bad "valid_ip: 1.2.3 отклонён" || ok "valid_ip: 1.2.3 отклонён"
@@ -87,7 +89,7 @@ valid_route_target example..org && bad "маршрут: пустая метка 
 [ "$(cron_spec 168)" = "17 4 */7 * *" ] && ok "cron: раз в неделю" || bad "cron: раз в неделю"
 
 echo "== прямой пинг (ping_one_direct)"
-eval "$(sed -n '/^ping_one_direct()/,/^}/p' root/usr/bin/vless)"
+eval "$(sed -n '/^ping_one_direct()/,/^}/p' $VSRC)"
 pdir="$(mktemp -d)"
 # Заглушка curl: поведение задаётся переменными FAKE_OUT и FAKE_RC (вывод -w и код выхода).
 cat > "$pdir/curl" <<'FAKE'
@@ -122,6 +124,10 @@ echo
 sh tests/backend.sh || fail=1
 echo
 sh tests/discord.sh || fail=1
+echo
+sh tests/modules.sh || fail=1
+echo
+sh tests/mock-drift.sh || fail=1
 echo
 [ $fail -eq 0 ] && echo "ВСЕ ТЕСТЫ ПРОЙДЕНЫ" || echo "ЕСТЬ ОШИБКИ"
 exit $fail

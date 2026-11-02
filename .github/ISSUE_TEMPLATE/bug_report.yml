@@ -1,0 +1,64 @@
+name: Сообщить об ошибке
+description: Что-то не работает или работает не так, как написано в README
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Не публикуйте свои ссылки, ключи и токены подписок.** Если они попали в журнал или вывод команды,
+        замените их на `***` перед отправкой.
+  - type: textarea
+    id: what
+    attributes:
+      label: Что случилось
+      description: Что вы делали, что ожидали и что получили.
+    validations:
+      required: true
+  - type: textarea
+    id: selftest
+    attributes:
+      label: Вывод `vless selftest`
+      description: Выполните на роутере `/usr/bin/vless selftest` и вставьте вывод.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Журнал
+      description: Вывод `logread -e vless | tail -n 50` и, если есть, вкладка «Журнал» в интерфейсе.
+      render: text
+  - type: input
+    id: openwrt
+    attributes:
+      label: Версия OpenWrt и устройство
+      placeholder: "OpenWrt 24.10.0, GL-MT6000"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия приложения и sing-box
+      placeholder: "luci-vless-selective 1.3.7-1, sing-box 1.12.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Как установлено
+      options: [INSTALL.bat (Windows), install.sh (ssh), .ipk (opkg), apk, собрано из исходников]
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Режим маршрутизации
+      options: [Весь трафик, "Всё, кроме российских сайтов", Только выбранные сервисы, Не знаю]
+  - type: checkboxes
+    id: others
+    attributes:
+      label: Проверка
+      options:
+        - label: Podkop и другие VPN, которые управляют маршрутизацией LAN, остановлены
+        - label: Я убрал из вывода и журнала ссылки, ключи и токены
+          required: true
