@@ -55,6 +55,9 @@ case "$1" in
 	"refresh":    { "id": "string" },
 	"select":     { "id": "string" },
 	"set":        { "settings": "object" },
+	"export":     {},
+	"import":     { "backup": "object" },
+	"fetch-core": { "force": "bool" },
 	"discord-status": {},
 	"discord-run":    { "action": "string" }
 }
@@ -64,8 +67,22 @@ JSON
 		IN="$(cat)"
 		arg() { printf '%s' "$IN" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null; }
 		case "$2" in
-			state|status|devices|logs|check|clear|clearlog|connect|disconnect)
+			state|status|devices|logs|check|clear|clearlog|connect|disconnect|export)
 				run "$2" ;;
+			import)
+				out="$(printf '%s' "$IN" | "$VLESS" import 2>"$RUN/rpcd.err")"
+				if [ -n "$out" ] && printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+					printf '%s\n' "$out"
+				else
+					log_err import
+					printf '{"ok":false,"error":"Не удалось импортировать настройки"}\n'
+				fi ;;
+			fetch-core)
+				if [ "$(arg force)" = "true" ] || [ "$(arg force)" = "1" ]; then
+					run fetch-core force
+				else
+					run fetch-core
+				fi ;;
 			ping|remove|refresh|select)
 				run "$2" "$(arg id)" ;;
 			ping-direct)

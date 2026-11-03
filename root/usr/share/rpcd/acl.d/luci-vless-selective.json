@@ -2,10 +2,10 @@
 	"luci-vless-selective": {
 		"description": "Доступ к приложению VPN",
 		"read": {
-			"ubus": { "vless": [ "state", "status", "devices", "logs", "discord-status" ] }
+			"ubus": { "vless": [ "state", "status", "devices", "logs", "discord-status", "export" ] }
 		},
 		"write": {
-			"ubus": { "vless": [ "add", "remove", "refresh", "select", "set", "connect", "disconnect", "check", "ping", "ping-direct", "clear", "clearlog", "discord-run" ] }
+			"ubus": { "vless": [ "add", "remove", "refresh", "select", "set", "connect", "disconnect", "check", "ping", "ping-direct", "clear", "clearlog", "discord-run", "export", "import", "fetch-core" ] }
 		}
 	}
 }

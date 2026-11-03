@@ -82,3 +82,22 @@ valid_route_target() {
 		*) valid_ip "$1" ;;
 	esac
 }
+
+valid_dns_server() {
+	local val="$1" host
+	case "$val" in
+		tls://*|udp://*)
+			host="${val#*://}"; host="${host%%:*}"
+			valid_ip "$host" || valid_domain "$host" || return 1
+			;;
+		https://*)
+			host="${val#https://}"; host="${host%%/*}"; host="${host%%:*}"
+			valid_ip "$host" || valid_domain "$host" || return 1
+			;;
+		*)
+			valid_ip "$val" || return 1
+			;;
+	esac
+	return 0
+}
+

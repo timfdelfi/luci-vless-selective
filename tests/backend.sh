@@ -68,6 +68,12 @@ t "set: числа принимаются" "$r" '.ok==true and (.ignored|length)
 grep -q '^17 \*/6 \* \* \* /usr/bin/vless update-all' "$VLESS_CRON" && ok "cron: запись «каждые 6 часов»" || bad "cron: запись «каждые 6 часов»"
 printf '%s' '{"update_interval":0}' | $H set >/dev/null
 grep -q update-all "$VLESS_CRON" && bad "cron: запись удалена при «выключено»" || ok "cron: запись удалена при «выключено»"
+r="$(printf '%s' '{"direct_dns":"tls://77.88.8.8"}' | $H set)"
+t "set: direct_dns DoT принимается" "$r" '.ok==true and (.ignored|length)==0'
+r="$($H settings)"
+t "settings: direct_dns сохранён" "$r" '.direct_dns=="tls://77.88.8.8"'
+r="$(printf '%s' '{"direct_dns":"bad-dns://invalid"}' | $H set)"
+t "set: невалидный direct_dns отклонён" "$r" '.ok==true and (.ignored|index("direct_dns"))'
 r="$(printf 'не json' | $H set)"
 t "set: некорректный JSON" "$r" '.ok==false'
 
@@ -208,6 +214,14 @@ r="$($H logs)"
 printf '%s' "$r" | jq -e '.log | test("предыдущий запуск")' >/dev/null 2>&1 \
 	&& ok "журнал показывает прошлый запуск отдельным блоком" || bad "прошлый запуск не виден в журнале"
 
+echo "== экспорт и импорт"
+exp="$($H export)"
+t "export: содержит ok, version, settings, servers" "$exp" '.ok==true and .version==1 and (.settings.mtu|type=="number") and (.servers|type=="array")'
+imp="$(printf '%s' "$exp" | $H import)"
+t "import: успешное восстановление из экспорта" "$imp" '.ok==true'
+imp_bad="$(printf '%s' '{"invalid":1}' | $H import)"
+t "import: отклонение невалидного файла" "$imp_bad" '.ok==false'
+
 echo "== rpcd-плагин"
 $RP list | jq -e 'has("connect") and has("set") and has("ping") and has("ping-direct")' >/dev/null && ok "list: валидный JSON с методами" || bad "list"
 # Каждый метод, который вызывает интерфейс, обязан быть в списке rpcd, иначе ubus его не отдаст.
@@ -256,4 +270,3 @@ $H state | jq -e '.settings.bypass_ru==true or .settings.bypass_ru==false' >/dev
 rm -rf "$W"
 [ $fail -eq 0 ] && echo "ТЕСТЫ БЭКЕНДА ПРОЙДЕНЫ" || echo "ЕСТЬ ОШИБКИ В БЭКЕНДЕ"
 exit $fail
-о

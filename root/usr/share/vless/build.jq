@@ -34,6 +34,31 @@ def is_domainlike: is_ip | not;
 # не работала вовсе. Приводим оба пути к одному виду: снять «*.», отбросить прочие «*».
 def plain: ltrimstr("*.") | select(contains("*") | not);
 
+def parse_dns($val; $default_type; $default_srv):
+  ($val // "") as $v
+  | if $v == "" then { type: $default_type, server: $default_srv }
+    elif ($v | startswith("tls://")) then
+      ($v | ltrimstr("tls://")) as $raw
+      | ($raw | split(":")[0]) as $host
+      | ($raw | split(":")[1]) as $port
+      | { type: "tls", server: $host } + (if $port then { server_port: ($port | tonumber) } else {} end)
+    elif ($v | startswith("https://")) then
+      ($v | ltrimstr("https://")) as $raw
+      | ($raw | split("/")[0]) as $hp
+      | ($raw | split("/") | if length > 1 then .[1:] | "/" + join("/") else "/dns-query" end) as $path
+      | ($hp | split(":")[0]) as $host
+      | ($hp | split(":")[1]) as $port
+      | { type: "https", server: $host, path: $path }
+        + (if $port then { server_port: ($port | tonumber) } else {} end)
+    elif ($v | startswith("udp://")) then
+      ($v | ltrimstr("udp://")) as $raw
+      | ($raw | split(":")[0]) as $host
+      | ($raw | split(":")[1]) as $port
+      | { type: "udp", server: $host } + (if $port then { server_port: ($port | tonumber) } else {} end)
+    else
+      { type: $default_type, server: $v }
+    end;
+
 ($servers[0] // []) as $all
 | ($all | map(select(.supported == true and .outbound != null))) as $list
 | if ($list | length) == 0 then error("Нет ни одного поддерживаемого сервера") else . end
@@ -60,11 +85,14 @@ def plain: ltrimstr("*.") | select(contains("*") | not);
 
     dns: {
       servers: [
-        { tag: "dns-remote", type: "tls", server: ($s.remote_dns // "1.1.1.1"), detour: "proxy" },
-        { tag: "dns-direct", type: "udp", server: ($s.bootstrap_dns // "77.88.8.8") }
+        (parse_dns($s.remote_dns; "tls"; "1.1.1.1") + { tag: "dns-remote", detour: "proxy" }),
+        (parse_dns($s.direct_dns; "udp"; ($s.bootstrap_dns // "77.88.8.8")) + { tag: "dns-direct" }),
+        { tag: "dns-bootstrap", type: "udp", server: ($s.bootstrap_dns // "77.88.8.8") }
       ],
       rules: (
-        (if ($vpn_hosts | length) > 0 then [{ domain: $vpn_hosts, server: "dns-direct" }] else [] end)
+        (parse_dns($s.direct_dns; "udp"; ($s.bootstrap_dns // "77.88.8.8")).server as $dh
+         | if ($dh | is_domainlike) then [{ domain: [$dh], server: "dns-bootstrap" }] else [] end)
+        + (if ($vpn_hosts | length) > 0 then [{ domain: $vpn_hosts, server: "dns-direct" }] else [] end)
         + (if ($dd_domains | length) > 0 then [{ domain_suffix: $dd_domains, server: "dns-direct" }] else [] end)
         + (if $sel then
              # выбранные сайты резолвим через VPN, остальные — напрямую

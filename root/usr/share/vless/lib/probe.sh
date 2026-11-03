@@ -104,15 +104,28 @@ cmd_ping() { # ping [ID] — без ID меряет все серверы, с ID
 # Меряет время установления TCP-соединения до server:port — хороший прокси для «как далеко сервер».
 # curl печатает %{time_connect} даже при неудаче, поэтому код возврата проверяется явно:
 # иначе недоступный сервер получал бы правдоподобный «пинг».
-ping_one_direct() { # ping_one_direct HOST PORT -> мс (время TCP connect) или ""
-	local host="$1" port="$2" out rc code tc ta u url
+ping_one_direct() { # ping_one_direct HOST PORT [PROTO] [SEC] -> мс (время RTT) или ""
+	local host="$1" port="$2" proto="$3" sec="$4" out rc code tc ta u url
+	# Для UDP-протоколов (Hysteria2, WireGuard) прямой пинг замеряется через ICMP к хосту
+	if [ "$proto" = "hysteria2" ] || [ "$proto" = "hy2" ] || [ "$proto" = "wireguard" ]; then
+		local p_out
+		p_out="$(ping -c 1 -W 2 "$host" 2>/dev/null || ping -c 1 -w 2 "$host" 2>/dev/null)"
+		echo "$p_out" | awk -F'/' '/rtt|round-trip/{printf "%d", $5; exit}' | grep -E '^[0-9]+$' && return 0
+		echo "$p_out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -n1 | awk '{printf "%d", $1}' | grep -E '^[0-9]+$' && return 0
+		return 0
+	fi
 	# IPv6-адрес в URL должен быть в квадратных скобках
 	u="$host"
 	case "$host" in *:*) u="[$host]" ;; esac
-	case "$port" in
-		80) url="http://$u" ;;
-		*)  url="https://$u:$port" ;;
-	esac
+	# Для чистого Shadowsocks без TLS (sec=none) подключаемся по http, чтобы не ждать TLS handshake
+	if [ "$proto" = "ss" ] && [ "$sec" = "none" ]; then
+		url="http://$u:$port"
+	else
+		case "$port" in
+			80) url="http://$u" ;;
+			*)  url="https://$u:$port" ;;
+		esac
+	fi
 	# -k: у Reality отдаётся сертификат сайта-маскировки, он не совпадает с адресом сервера.
 	# Код выхода curl не отбрасывает результат: сервер VLESS/Trojan без fallback закрывает
 	# соединение на HTTP-запрос (curl 52/56), хотя TCP и TLS уже прошли — он живой.
@@ -123,6 +136,10 @@ ping_one_direct() { # ping_one_direct HOST PORT -> мс (время TCP connect)
 	code="$1"; tc="$2"; ta="$3"
 	printf '%s' "$tc" | grep -qE '^[0-9]+\.[0-9]+$' || return 0
 	awk -v t="$tc" 'BEGIN{exit !(t>0)}' || return 0
+	# Для Shadowsocks без TLS достаточно успешного TCP connect
+	if [ "$proto" = "ss" ] && [ "$sec" = "none" ]; then
+		case "$rc" in 0|52|56) awk -v t="$tc" 'BEGIN{printf "%d", t*1000}'; return 0 ;; *) return 0 ;; esac
+	fi
 	case "$code" in
 		[1-5][0-9][0-9]) ;;
 		*)
@@ -141,12 +158,14 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 	[ -s "$RUN/delays.json" ] || echo '{}' > "$RUN/delays.json"
 	if [ -n "$id" ]; then
 		echo "$id" | grep -qE '^[0-9a-f]{8}$' || { json_err "Некорректный id"; return 0; }
-		d="$(jq -r --arg id "$id" '.[]|select(.id==$id)|[.server,(.port|tostring)]|@tsv' "$SERVERS" 2>/dev/null)"
+		d="$(jq -r --arg id "$id" '.[]|select(.id==$id)|[.server,(.port|tostring),(.proto // ""),(.sec // "")]|@tsv' "$SERVERS" 2>/dev/null)"
 		[ -n "$d" ] || { json_err "Сервер не найден"; return 0; }
-		local host port ms
+		local host port proto sec ms
 		host="$(printf '%s' "$d" | cut -f1)"
 		port="$(printf '%s' "$d" | cut -f2)"
-		ms="$(ping_one_direct "$host" "$port")"
+		proto="$(printf '%s' "$d" | cut -f3)"
+		sec="$(printf '%s' "$d" | cut -f4)"
+		ms="$(ping_one_direct "$host" "$port" "$proto" "$sec")"
 		if [ -n "$ms" ]; then
 			jq -c --arg id "$id" --argjson d "$ms" '. + {($id):$d}' "$RUN/delays.json" > "$RUN/delays.tmp" && mv "$RUN/delays.tmp" "$RUN/delays.json"
 			jq -n -c --slurpfile all "$RUN/delays.json" --argjson d "$ms" '{ok:true,ms:$d,delays:$all[0],direct:true}'
@@ -157,12 +176,12 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 		return 0
 	fi
 	# параллельный пинг всех серверов (через файлы: <(...) не работает в sh)
-	jq -r '.[]|[.id,.server,(.port|tostring)]|@tsv' "$SERVERS" 2>/dev/null | tr -d '\r' > "$RUN/pingtab"
+	jq -r '.[]|[.id,.server,(.port|tostring),(.proto // ""),(.sec // "")]|@tsv' "$SERVERS" 2>/dev/null | tr -d '\r' > "$RUN/pingtab"
 	local result="{}" n=0 p
 	pids=""
-	while IFS="$TAB" read -r id host port; do
+	while IFS="$TAB" read -r id host port proto sec; do
 		[ -n "$id" ] && [ -n "$host" ] && [ -n "$port" ] || continue
-		( ms="$(ping_one_direct "$host" "$port")"; printf '%s\t%s\n' "$id" "${ms:-FAIL}" > "$RUN/pingd.$id" ) &
+		( ms="$(ping_one_direct "$host" "$port" "$proto" "$sec")"; printf '%s\t%s\n' "$id" "${ms:-FAIL}" > "$RUN/pingd.$id" ) &
 		pids="$pids $!"
 		join_jobs
 	done < "$RUN/pingtab"

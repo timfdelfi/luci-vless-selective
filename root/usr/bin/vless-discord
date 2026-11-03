@@ -78,8 +78,12 @@ busy_what() {
 exclusive() { # exclusive ИМЯ КОМАНДА [АРГУМЕНТЫ…]
 	local what="$1"; shift
 	dlock "$what" || { json_err "Занято: сейчас выполняется «$(busy_what)». Повторите через минуту."; return 1; }
-	trap dunlock EXIT
+	trap dunlock EXIT INT TERM
 	"$@"
+	local rc=$?
+	dunlock
+	trap - EXIT INT TERM
+	return $rc
 }
 
 # ---------------------------------------------------------------- стратегии

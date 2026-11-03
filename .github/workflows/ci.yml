@@ -53,6 +53,9 @@ jobs:
       - name: node --check для интерфейса
         run: node --check htdocs/luci-static/resources/view/vless/main.js
 
+      - name: Согласованность релиза (VERSION, CHANGELOG, шаблоны)
+        run: sh ci/check-release.sh
+
       - name: Модули бэкенда (состав, диспетчер, дубли функций)
         run: sh tests/modules.sh
 
@@ -163,6 +166,9 @@ jobs:
       - name: Проверить, что файлы собраны (dist)
         run: ls -l dist/
 
+      - name: Проверить контрольные суммы
+        run: cd dist && sha256sum -c SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -198,4 +204,6 @@ jobs:
             dist/vless-vpn.tar.gz
             dist/vless-vpn.zip
             dist/*.ipk
+            dist/install.sh
+            dist/SHA256SUMS
             dist/*.sha256

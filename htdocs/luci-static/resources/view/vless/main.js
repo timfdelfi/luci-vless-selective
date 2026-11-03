@@ -29,6 +29,9 @@ var rDevices    = H('devices');
 var rLogs       = H('logs');
 var rClear      = H('clear');
 var rClearLog   = H('clearlog');
+var rExport     = H('export');
+var rImport     = H('import', ['backup']);
+var rFetchCore  = H('fetch-core', ['force']);
 var rDiscordStatus = H('discord-status');
 var rDiscordRun    = H('discord-run', ['action']);
 
@@ -184,6 +187,12 @@ var CSS = [
 '.hv-sub{color:var(--tx2);font-size:12.5px;margin-top:2px;text-align:center;min-height:18px}',
 '.hv-timer{font-size:14px;font-weight:600;color:var(--tx2);margin-top:2px;font-variant-numeric:tabular-nums;min-height:20px}',
 '.hv-cur{display:flex;align-items:center;gap:10px;margin:14px 0 0;padding:9px 11px;background:var(--card2);border:1px solid var(--line);border-radius:var(--r);width:100%;min-width:0}',
+'.hv-meter{background:var(--card2);border:1px solid var(--line);border-radius:var(--r);padding:10px 12px;margin-top:10px;text-align:center;width:100%}',
+'.hv-meter-speed{display:flex;align-items:center;justify-content:center;gap:12px;font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}',
+'.hv-m-down{color:var(--ok);display:inline-flex;align-items:center;gap:5px}',
+'.hv-m-up{color:var(--ac);display:inline-flex;align-items:center;gap:5px}',
+'.hv-m-sep{color:var(--tx2);opacity:.4;font-size:16px}',
+'.hv-meter-sub{font-size:11.5px;color:var(--tx2);margin-top:3px;font-variant-numeric:tabular-nums}',
 '.hv-stats{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px;width:100%}',
 '.hv-stat{background:var(--card2);border:1px solid var(--line);border-radius:var(--r);padding:7px 10px;min-width:0}',
 '.hv-stat span{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--tx2);font-weight:700;letter-spacing:.04em;text-transform:uppercase}',
@@ -291,6 +300,8 @@ var ICON = {
 	warn: '<svg viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
 	down: '<svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>',
 	up: '<svg viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>',
+	download: '<svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+	upload: '<svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
 	copy: '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
 	route: '<svg viewBox="0 0 24 24"><circle cx="6" cy="19" r="3"/><circle cx="18" cy="5" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/></svg>',
 	shield: '<svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
@@ -390,6 +401,14 @@ function flagEl(code, auto) {
 function fmtBytes(n) {
 	n = +n || 0;
 	var u = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'], i = 0;
+	while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+	return (n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)).replace('.', ',') + ' ' + u[i];
+}
+
+function fmtSpeed(n) {
+	n = +n || 0;
+	if (n <= 0) return '0 Б/с';
+	var u = ['Б/с', 'КБ/с', 'МБ/с', 'ГБ/с'], i = 0;
 	while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
 	return (n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)).replace('.', ',') + ' ' + u[i];
 }
@@ -555,7 +574,7 @@ return view.extend({
 			if (self.phase() === 'on' && self._upSince && self.timerEl)
 				self.timerEl.textContent = fmtTime(Math.floor(Date.now() / 1000) - self._upSince);
 			if (document.hidden) return;
-			var fast = self.busy ? 1 : 3;
+			var fast = (self.busy || (self.tab === 'main' && self.phase() === 'on')) ? 1 : 3;
 			if (self.tab === 'main' || self.tab === 'settings' || self.busy) {
 				if (self._tick % 30 === 0) self.refreshAll();
 				else if (self._tick % fast === 0) self.pollStatus();
@@ -908,11 +927,27 @@ return view.extend({
 				};
 				this._statRefs = {};
 				this.statsEl.innerHTML = '';
+				var sDown = E('span', { 'class': 'hv-m-down' }, [E('i', {}, '↓'), E('b', {}, '0 Б/с')]);
+				var sUp = E('span', { 'class': 'hv-m-up' }, [E('i', {}, '↑'), E('b', {}, '0 Б/с')]);
+				var sSub = E('div', { 'class': 'hv-meter-sub' }, 'Сессия: 0 Б');
+				this._statRefs.speedDown = sDown.querySelector('b');
+				this._statRefs.speedUp = sUp.querySelector('b');
+				this._statRefs.sessionSub = sSub;
+
+				this.statsEl.appendChild(E('div', { 'class': 'hv-meter' }, [
+					E('div', { 'class': 'hv-meter-speed' }, [
+						sDown,
+						E('span', { 'class': 'hv-m-sep' }, '·'),
+						sUp
+					]),
+					sSub
+				]));
+
 				this.statsEl.appendChild(E('div', { 'class': 'hv-stats' }, [
 					cell('ping', 'zap', 'Пинг'),
 					cell('ip', 'globe', 'IP'),
-					cell('down', 'down', 'Получено'),
-					cell('up', 'up', 'Отправлено')
+					cell('down', 'down', 'Скачано'),
+					cell('up', 'up', 'Отдано')
 				]));
 				this.statsEl.appendChild(E('div', { 'class': 'hv-actions' }, [
 					E('button', { type: 'button', 'class': 'hv-btn ghost sm', title: 'Замерить пинг и определить IP заново',
@@ -920,13 +955,21 @@ return view.extend({
 				]));
 			}
 			var R = this._statRefs;
+			var dRate = (this.rate && this.rate.down) || 0;
+			var uRate = (this.rate && this.rate.up) || 0;
+			if (R.speedDown) R.speedDown.textContent = fmtSpeed(dRate);
+			if (R.speedUp) R.speedUp.textContent = fmtSpeed(uRate);
+			if (R.sessionSub) {
+				var tot = (st.down || 0) + (st.up || 0);
+				R.sessionSub.textContent = 'Трафик за сессию: ' + fmtBytes(tot) + ' (↓ ' + fmtBytes(st.down) + ' · ↑ ' + fmtBytes(st.up) + ')';
+			}
 			R.ping.v.textContent = delay != null ? delay + ' мс' : '—';
 			R.ip.v.textContent = ipText(ip);
 			R.ip.v.setAttribute('title', ipText(ip));
 			R.down.v.textContent = fmtBytes(st.down);
-			R.down.s.textContent = this.rate.down > 0 ? fmtBytes(this.rate.down) + '/с' : '';
+			R.down.s.textContent = dRate > 0 ? fmtSpeed(dRate) : '';
 			R.up.v.textContent = fmtBytes(st.up);
-			R.up.s.textContent = this.rate.up > 0 ? fmtBytes(this.rate.up) + '/с' : '';
+			R.up.s.textContent = uRate > 0 ? fmtSpeed(uRate) : '';
 		} else if (this._statRefs) {
 			this._statRefs = null;
 			this.statsEl.innerHTML = '';
@@ -1165,11 +1208,19 @@ return view.extend({
 		var prevPhase = this.phase(), now = Date.now();
 		/* Ответ, запрошенный до последнего действия, не должен откатывать интерфейс назад */
 		if (gen !== undefined && gen !== this._gen) return;
-		/* скорость по разнице счётчиков */
-		if (r.connected && this._prev && now > this._prev.t && r.down >= this._prev.down && r.up >= this._prev.up) {
-			var dt = (now - this._prev.t) / 1000;
-			this.rate = { down: (r.down - this._prev.down) / dt, up: (r.up - this._prev.up) / dt };
-		} else this.rate = { down: 0, up: 0 };
+		/* скорость по разнице счётчиков или из r.speed_down / r.speed_up */
+		if (r.connected) {
+			if (r.speed_down !== undefined && r.speed_up !== undefined) {
+				this.rate = { down: +r.speed_down || 0, up: +r.speed_up || 0 };
+			} else if (this._prev && now > this._prev.t && r.down >= this._prev.down && r.up >= this._prev.up) {
+				var dt = (now - this._prev.t) / 1000;
+				this.rate = { down: dt > 0 ? (r.down - this._prev.down) / dt : 0, up: dt > 0 ? (r.up - this._prev.up) / dt : 0 };
+			} else {
+				this.rate = { down: 0, up: 0 };
+			}
+		} else {
+			this.rate = { down: 0, up: 0 };
+		}
 		this._prev = r.connected ? { t: now, down: r.down || 0, up: r.up || 0 } : null;
 
 		this.S.status = r;
@@ -1379,7 +1430,7 @@ return view.extend({
 		presetBox.appendChild(chipBox);
 		presetBox.appendChild(E('div', { 'class': 'hv-label' }, ['Свои сайты через VPN', E('span', {}, 'Домены или подсети, по одному в строке')]));
 		presetBox.appendChild(area('proxy_domains', s.proxy_domains, 'example.com\n203.0.113.0/24'));
-		presetBox.appendChild(E('div', { 'class': 'hv-hint' }, 'Остальной трафик идёт напрямую, мимо VPN и без обработки роутером. Сервис попадает в VPN, когда его адрес запрошен через роутер.'));
+		presetBox.appendChild(E('div', { 'class': 'hv-hint' }, 'Остальной трафик идёт напрямую, мимо VPN. Сервис попадает в VPN, когда его адрес запрошен через DNS роутера (отключите «Частный DNS» на смартфонах и DoH в браузерах).'));
 
 		/* — устройства — */
 		this.devBox = E('div', { 'class': 'hv-devs' });
@@ -1406,6 +1457,22 @@ return view.extend({
 		dnsCustom.style.marginTop = '8px';
 		var syncDns = function () { dnsCustom.style.display = dnsSel.value === 'custom' ? '' : 'none'; };
 		dnsSel.addEventListener('change', syncDns); syncDns();
+
+		var dirDnsPresets = [
+			['tls://77.88.8.8', 'Яндекс DoT (tls://77.88.8.8)'],
+			['https://dns.adguard-dns.com/dns-query', 'AdGuard DoH (https://...)'],
+			['tls://1.1.1.1', 'Cloudflare DoT (tls://1.1.1.1)'],
+			['77.88.8.8', 'Яндекс UDP (77.88.8.8:53)']
+		];
+		var dirDnsCur = s.direct_dns || 'tls://77.88.8.8';
+		var dirDnsKnown = dirDnsPresets.some(function (p) { return p[0] === dirDnsCur; });
+		var dirDnsItems = dirDnsPresets.slice();
+		dirDnsItems.push(['custom', 'Свой адрес…']);
+		var dirDnsSel = select('direct_dns_sel', dirDnsItems, dirDnsKnown ? dirDnsCur : 'custom');
+		var dirDnsCustom = input('direct_dns_custom', dirDnsKnown ? '' : dirDnsCur, 'tls://77.88.8.8 или https://...');
+		dirDnsCustom.style.marginTop = '8px';
+		var syncDirDns = function () { dirDnsCustom.style.display = dirDnsSel.value === 'custom' ? '' : 'none'; };
+		dirDnsSel.addEventListener('change', syncDirDns); syncDirDns();
 
 		/* — HWID — */
 		var hwidRow = E('div', { 'class': 'hv-hwid' }, [
@@ -1443,6 +1510,7 @@ return view.extend({
 			section('shield', 'DNS и защита', 'Тонкие настройки — обычно трогать не нужно.', [
 				toggleRow('dns_vpn', 'DNS через VPN', 'DNS-запросы клиентов уходят через туннель (DoT)', (s.dns_mode || 'vpn') === 'vpn', true),
 				optRow('Удалённый DNS', 'DNS-сервер внутри VPN', [dnsSel, dnsCustom], false, true),
+				optRow('Прямой DNS (DoT / DoH)', 'Для незаблокированных сайтов: защищает от подмены провайдером', [dirDnsSel, dirDnsCustom], false, true),
 				toggleRow('block_ipv6', 'Блокировать IPv6', 'Иначе IPv6-трафик клиентов утечёт мимо VPN', s.block_ipv6 !== false),
 				toggleRow('block_quic', 'Блокировать QUIC', 'Отключает UDP/443 — браузеры переходят на TCP (может помочь с YouTube)', s.block_quic !== false),
 				toggleRow('bypass_vpn', 'VPN-серверы мимо туннеля', 'Если на телефоне или ПК запущен свой VPN с теми же серверами, он продолжит работать', s.bypass_vpn !== false)
@@ -1459,6 +1527,44 @@ return view.extend({
 
 		this.paneSet.appendChild(E('div', { 'class': 'hv-set' }, [left, right]));
 		this.drawDiscord();
+
+		/* — Резервная копия — */
+		var backupFileInput = E('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+		backupFileInput.addEventListener('change', function (e) {
+			var file = e.target.files && e.target.files[0];
+			if (!file) return;
+			var reader = new FileReader();
+			reader.onload = function (ev) {
+				try {
+					var data = JSON.parse(ev.target.result);
+					self.importBackup(data);
+				} catch (err) {
+					self.toast('Файл повреждён или не является JSON: ' + err.message, true);
+				}
+				backupFileInput.value = '';
+			};
+			reader.readAsText(file);
+		});
+
+		var exportBtn = E('button', {
+			type: 'button', 'class': 'hv-btn ghost',
+			click: function () { self.exportBackup(); }
+		}, [ic('download'), E('span', {}, 'Экспорт настроек')]);
+
+		var importBtn = E('button', {
+			type: 'button', 'class': 'hv-btn ghost',
+			click: function () { backupFileInput.click(); }
+		}, [ic('upload'), E('span', {}, 'Импорт настроек')]);
+
+		this.paneSet.appendChild(E('div', { 'class': 'hv-card hv-sec', style: 'margin-top:14px' }, [
+			E('h3', {}, [ic('copy'), 'Резервная копия']),
+			E('p', {}, 'Экспорт и импорт всех настроек, подписок и добавленных серверов (для сохранения перед перепрошивкой).'),
+			E('div', { style: 'display:flex;gap:10px;margin-top:10px;flex-wrap:wrap' }, [
+				exportBtn,
+				importBtn,
+				backupFileInput
+			])
+		]));
 
 		this.paneSet.appendChild(E('div', { 'class': 'hv-card hv-danger' }, [
 			E('div', { 'class': 't' }, [E('b', {}, 'Сбросить серверы'), E('span', {}, 'Удалит все подписки и ключи и остановит VPN. Настройки сохранятся.')]),
@@ -1496,6 +1602,10 @@ return view.extend({
 		var dns = custom ? F.dns_custom.get() : F.dns_sel.get();
 		if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(dns) || dns.split('.').some(function (n) { return +n > 255; }))
 			return fail(custom ? F.dns_custom : F.dns_sel, 'DNS-сервер должен быть IP-адресом, например 1.1.1.1');
+		var customDir = F.direct_dns_sel.get() === 'custom';
+		var dirDns = customDir ? F.direct_dns_custom.get() : F.direct_dns_sel.get();
+		if (!dirDns || !/^(tls:\/\/|https:\/\/|udp:\/\/|\d{1,3}(\.\d{1,3}){3})/.test(dirDns))
+			return fail(customDir ? F.direct_dns_custom : F.direct_dns_sel, 'Прямой DNS: укажите IP, tls://... или https://...');
 		var mtu = parseInt(F.mtu.get(), 10);
 		if (!(mtu >= 1000 && mtu <= 9000)) return fail(F.mtu, 'MTU должен быть от 1000 до 9000');
 		var tolerance = parseInt(F.auto_tolerance.get(), 10);
@@ -1526,6 +1636,7 @@ return view.extend({
 			block_quic: F.block_quic.get(),
 			bypass_vpn: F.bypass_vpn.get(),
 			remote_dns: dns,
+			direct_dns: dirDns,
 			tun_stack: F.tun_stack.get(),
 			mtu: mtu,
 			log_level: F.log_level.get(),
@@ -1644,6 +1755,52 @@ return view.extend({
 				self.setTab('main');
 				self.refreshAll();
 			}).catch(function () { self.toast('Не удалось удалить', true); });
+		});
+	},
+
+	exportBackup: function () {
+		var self = this;
+		rExport().then(function (r) {
+			if (!r || !r.ok) {
+				self.toast((r && r.error) || 'Не удалось экспортировать настройки', true);
+				return;
+			}
+			var json = JSON.stringify(r.backup || r, null, 2);
+			var blob = new Blob([json], { type: 'application/json' });
+			var url = URL.createObjectURL(blob);
+			var a = document.createElement('a');
+			var d = new Date();
+			var ds = d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+			a.href = url;
+			a.download = 'vless-backup-' + ds + '.json';
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+			self.toast('Резервная копия скачана');
+		}).catch(function () {
+			self.toast('Ошибка при экспорте резервной копии', true);
+		});
+	},
+
+	importBackup: function (data) {
+		var self = this;
+		if (!data || typeof data !== 'object') {
+			this.toast('Некорректные данные резервной копии', true);
+			return;
+		}
+		this.confirmDlg('Восстановить из файла?', 'Текущие настройки, серверы и подписки будут заменены данными из резервной копии.', 'Восстановить', false, function () {
+			rImport(data).then(function (r) {
+				if (!r || !r.ok) {
+					self.toast((r && r.error) || 'Не удалось восстановить настройки', true);
+					return;
+				}
+				self.toast('Настройки успешно восстановлены!');
+				self.refreshAll();
+				self.buildSettings();
+			}).catch(function () {
+				self.toast('Роутер не ответил при импорте резервной копии', true);
+			});
 		});
 	},
 

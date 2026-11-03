@@ -41,7 +41,7 @@ cmd_prepare() {
 	fi
 	[ -c /dev/net/tun ] || { modprobe tun 2>/dev/null; sleep 1; }
 	[ -c /dev/net/tun ] || { set_error "Нет устройства /dev/net/tun. Установите: opkg install kmod-tun"; return 1; }
-	secret="$(cat /proc/sys/kernel/random/uuid)"
+	[ -r /proc/sys/kernel/random/uuid ] && secret="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)" || secret="$( ( date +%s%N 2>/dev/null || date +%s ) | md5sum | cut -c1-32)"
 	printf '%s' "$secret" > "$RUN/secret"; chmod 600 "$RUN/secret"
 	if ! out="$(jq -n -L "$LIB" -f "$LIB/build.jq" --slurpfile servers "$SERVERS" --argjson s "$(effective_settings)" \
 			--arg secret "$secret" --arg selected "$(cfg selected auto)" --arg logfile "$RUN/sing-box.log" 2>&1 > "$CONFIG.tmp")"; then
@@ -129,3 +129,112 @@ cmd_run() {
 	printf '%s\n' "$!" > "$RUN/net_up.pid"
 	exec sing-box run -D "$RUN" -c "$CONFIG"
 }
+
+# ---------------------------------------------------------------- автозагрузка sing-box
+
+# Определение архитектуры роутера для официальных релизов SagerNet/sing-box
+singbox_arch_candidates() {
+	local a o
+	a="$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_ARCH")"
+	[ -n "$a" ] || a="$(uname -m 2>/dev/null)"
+	o="$(opkg print-architecture 2>/dev/null | awk '{print $2}' | grep -v '^all$' | tr '\n' ' ' 2>/dev/null)"
+	case "$a $o" in
+		*x86_64*|*amd64*)
+			echo "linux-amd64" ;;
+		*i386*|*i686*|*x86*)
+			echo "linux-386" ;;
+		*aarch64*|*arm64*)
+			echo "linux-arm64" ;;
+		*arm_cortex*|*armv7*|*armv8l*|*arm_arm1176*)
+			echo "linux-armv7 linux-armv6 linux-armv5" ;;
+		*armv6*)
+			echo "linux-armv6 linux-armv5" ;;
+		*arm*)
+			echo "linux-armv7 linux-armv6 linux-armv5" ;;
+		*mipsel_24kc*|*mipsel_74kc*|*mips32r2*el*|*mipsel*)
+			echo "linux-mipsle-softfloat linux-mipsle-hardfloat" ;;
+		*mips64el*)
+			echo "linux-mips64le" ;;
+		*mips64*)
+			echo "linux-mips64" ;;
+		*mips_24kc*|*mips_74kc*|*mips*)
+			echo "linux-mips-softfloat linux-mips-hardfloat" ;;
+		*riscv64*)
+			echo "linux-riscv64" ;;
+		*)
+			echo "" ;;
+	esac
+}
+
+sb_extract() { # sb_extract URL DEST_DIR — потоковая загрузка и распаковка без сохранения архива в RAM
+	curl -fsSL -m 90 --connect-timeout 10 "$1" 2>/dev/null | tar -xzf - -C "$2" 2>/dev/null && return 0
+	if is_running; then
+		curl -fsSL -m 120 --connect-timeout 10 -x "socks5h://127.0.0.1:$MIXED_PORT" "$1" 2>/dev/null | tar -xzf - -C "$2" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+cmd_fetch_core() { # fetch-core [force]
+	local archs tag ver found="" w="/tmp/sb-fetch-$$" c url bin_dir="/usr/bin"
+	archs="$(singbox_arch_candidates)"
+	[ -n "$archs" ] || { json_err "Не удалось определить архитектуру роутера ($(uname -m 2>/dev/null))"; return 1; }
+
+	local free_flash
+	free_flash="$(df -k "$bin_dir" 2>/dev/null | awk 'NR==2{print $4}')"
+	[ -n "$free_flash" ] || free_flash="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
+	[ -n "$free_flash" ] || free_flash="$(df -k / 2>/dev/null | awk 'NR==2{print $4}')"
+	if [ -n "$free_flash" ] && [ "$free_flash" -lt 25000 ]; then
+		json_err "Недостаточно места во flash для sing-box (${free_flash} КБ свободно, требуется ~30 МБ)"
+		return 1
+	fi
+
+	if [ "$1" != force ] && command -v sing-box >/dev/null 2>&1; then
+		ver="$(sb_version)"
+		local maj min
+		maj="${ver%%.*}"; min="${ver#*.}"; min="${min%%.*}"
+		if [ "${maj:-0}" -ge 1 ] && [ "${min:-0}" -ge 12 ]; then
+			jq -n -c --arg ver "$ver" '{ok:true,already_installed:true,version:$ver}'
+			return 0
+		fi
+	fi
+
+	mkdir -p "$w"
+	# Получаем версию релиза (через API или Location-редирект)
+	tag="$(curl -fsSL -m 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)"
+	[ -n "$tag" ] || tag="$(curl -sI -m 10 "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -i '^Location:' | sed -E 's#.*tag/(v?[^[:space:]\r\n]+).*#\1#' | head -n1)"
+	[ -n "$tag" ] || tag="v1.14.4"
+	ver="${tag#v}"
+
+	for c in $archs; do
+		rm -rf "$w/extract"
+		mkdir -p "$w/extract"
+		url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-${c}.tar.gz"
+		if sb_extract "$url" "$w/extract"; then
+			found="$(find "$w/extract" -name sing-box -type f 2>/dev/null | head -n1)"
+			[ -n "$found" ] || continue
+			chmod 755 "$found"
+			if "$found" version >/dev/null 2>&1; then
+				break
+			else
+				found=""
+			fi
+		fi
+	done
+
+	if [ -z "$found" ]; then
+		rm -rf "$w"
+		json_err "Не удалось загрузить работающий бинарник sing-box для архитектуры: $archs"
+		return 1
+	fi
+
+	[ -d "$bin_dir" ] || bin_dir="/bin"
+	cp "$found" "$bin_dir/sing-box.new" && chmod 755 "$bin_dir/sing-box.new" && mv "$bin_dir/sing-box.new" "$bin_dir/sing-box" || {
+		rm -rf "$w"
+		json_err "Не удалось записать $bin_dir/sing-box (недостаточно места?)"
+		return 1
+	}
+	ver="$("$bin_dir/sing-box" version 2>/dev/null | head -n1 | awk '{print $3}')"
+	rm -rf "$w"
+	jq -n -c --arg ver "$ver" '{ok:true,installed:true,version:$ver}'
+}
+

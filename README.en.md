@@ -20,6 +20,10 @@ It runs [sing-box](https://github.com/SagerNet/sing-box) in TUN mode and routes 
 
 - **Zero setup.** Paste a subscription URL or a single key; everything else is configured automatically.
 - **Auto server selection.** "Auto" mode measures latency and switches to the fastest server. Check interval, switch threshold and probe URL are configurable.
+- **Live speedometer & session traffic counter.** Real-time download/upload speed (↓/↑) and total transferred session data right on the status card.
+- **Direct DNS protection (DoT / DoH).** Encrypted DNS for direct unblocked traffic (`tls://77.88.8.8`, `https://dns.adguard-dns.com/dns-query`, etc.) — protects against ISP UDP:53 interception and DNS poisoning.
+- **Backup & Restore.** Export and import all settings, subscriptions and servers as a single JSON file directly from the web interface or CLI (`vless export` / `vless import`).
+- **Official sing-box core download.** Automatically detects router CPU architecture (`mipsle`, `aarch64`, `arm`, `x86_64`, etc.) and downloads the official sing-box binary if not available in opkg or outdated (`vless fetch-core`).
 - **Formats.** `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, and subscriptions over `https://…` (plain, base64, Xray JSON). Reality, TLS, WebSocket, gRPC, HTTPUpgrade, h2.
 - **Routing presets.** Everything, "everything except Russian sites", or "selected services only": Telegram, YouTube, Discord, Meta, X, AI services, 18+ — plus your own sites.
 - **Subscription info.** Remaining traffic and expiry date, automatic subscription refresh.
@@ -30,6 +34,16 @@ It runs [sing-box](https://github.com/SagerNet/sing-box) in TUN mode and routes 
 - **A tidy neighbour.** Its own sing-box instance; `/etc/sing-box` is never touched.
 
 ## Installation
+
+**One-liner via SSH (recommended)**
+
+Connect to your router via SSH and run:
+
+```sh
+sh -c "$(curl -fsSL https://github.com/timfdelfi/luci-vless-selective/releases/latest/download/install.sh)"
+```
+
+The script automatically downloads the latest release, detects CPU architecture (`mipsle`, `aarch64`, `arm`, `x86_64`, etc.), installs dependencies and the official `sing-box` binary.
 
 **Windows**
 
@@ -94,6 +108,13 @@ Good to know: flow offloading is turned off while the bypass is on; voice cannot
 | No "VPN" menu entry | Ctrl+F5, then log in to LuCI again |
 
 System log: `logread -e vless`. Still stuck? [Open an issue](https://github.com/timfdelfi/luci-vless-selective/issues/new/choose) and attach the `selftest` output. **Do not publish your links and keys.**
+
+## Verifying what you install
+
+`install.sh` checks the release archive against `SHA256SUMS` and the official `sing-box` build against the
+checksum published by the GitHub API; on a mismatch nothing is installed. Pin versions with
+`VLESS_VERSION=1.3.8` and `VLESS_SINGBOX_TAG=v1.12.0`. See [SECURITY.md](SECURITY.md) (in Russian) for what this
+does and does not protect against. Architecture overview: [docs/ARCHITECTURE.en.md](docs/ARCHITECTURE.en.md).
 
 ## Limitations
 

@@ -52,7 +52,7 @@ done
 case "$1" in
 	state)      cmd_state ;;
 	status)     cmd_status ;;
-	add)        shift; locked cmd_add "$1" ;;
+	add)        shift; locked cmd_add "$@" ;;
 	remove)     locked cmd_remove "$2" ;;
 	refresh)    locked cmd_refresh "$2" ;;
 	# Результат не показывается (команда вызывается из cron), но о неудаче
@@ -82,8 +82,11 @@ case "$1" in
 	discord-sync) locked cmd_discord_sync ;;
 	effective)  effective_settings ;;
 	settings)   settings_json ;;
+	fetch-core) cmd_fetch_core "$2" ;;
+	export)     cmd_export ;;
+	import)     locked cmd_import ;;
 	selftest)   cmd_selftest ;;
 	*)
-		echo "Использование: vless {state|status|connect|disconnect|add <текст>|remove <id>|refresh [id]|select <id|auto>|set|check|ping|logs|clearlog|clear|selftest}" >&2
+		echo "Использование: vless {state|status|connect|disconnect|add <текст>|remove <id>|refresh [id]|select <id|auto>|set|check|ping|logs|clearlog|clear|export|import|fetch-core|selftest}" >&2
 		exit 1 ;;
 esac

@@ -3,17 +3,31 @@
 # Подключается из /usr/bin/vless (общие переменные и функции живут там и в других модулях); отдельно не запускается.
 
 cmd_status() {
-	local running=false ready=false active="" up=0 down=0 since=0 err="" now
+	local running=false ready=false active="" up=0 down=0 speed_up=0 speed_down=0 since=0 err="" now
 	is_running && running=true
 	is_ready && ready=true
+	now="$(date +%s)"
 	if [ "$ready" = true ]; then
-		now="$(api GET /proxies/proxy | jq -r '.now // empty' 2>/dev/null)"
-		[ "$now" = "auto" ] && now="$(api GET /proxies/auto | jq -r '.now // empty' 2>/dev/null)"
-		active="${now#s-}"
+		local now_act
+		now_act="$(api GET /proxies/proxy | jq -r '.now // empty' 2>/dev/null)"
+		[ "$now_act" = "auto" ] && now_act="$(api GET /proxies/auto | jq -r '.now // empty' 2>/dev/null)"
+		active="${now_act#s-}"
 		api GET /connections > "$RUN/conn.json.tmp" 2>/dev/null && mv "$RUN/conn.json.tmp" "$RUN/conn.json"
 		up="$(jq -r '.uploadTotal // 0' "$RUN/conn.json" 2>/dev/null)"
 		down="$(jq -r '.downloadTotal // 0' "$RUN/conn.json" 2>/dev/null)"
 		since="$(cat "$RUN/up_since" 2>/dev/null)"
+		if [ -s "$RUN/traffic.prev" ]; then
+			local prev_t prev_u prev_d dt
+			read -r prev_t prev_u prev_d < "$RUN/traffic.prev" 2>/dev/null
+			dt=$((now - ${prev_t:-0}))
+			if [ "$dt" -ge 1 ] && [ "${up:-0}" -ge "${prev_u:-0}" ] && [ "${down:-0}" -ge "${prev_d:-0}" ]; then
+				speed_up=$(( (${up:-0} - ${prev_u:-0}) / dt ))
+				speed_down=$(( (${down:-0} - ${prev_d:-0}) / dt ))
+			fi
+		fi
+		echo "$now ${up:-0} ${down:-0}" > "$RUN/traffic.prev"
+	else
+		rm -f "$RUN/traffic.prev"
 	fi
 	if [ "$ready" = false ]; then
 		err="$(cat "$RUN/last_error" 2>/dev/null)"
@@ -24,9 +38,12 @@ cmd_status() {
 	mine="$(cat "$PIDFILE" 2>/dev/null)"
 	for p in $(pgrep -x sing-box 2>/dev/null); do [ "$p" != "$mine" ] && other=true; done
 	jq -n -c --argjson running "$running" --argjson ready "$ready" --arg active "$active" \
-		--argjson up "${up:-0}" --argjson down "${down:-0}" --argjson since "${since:-0}" --argjson now "$(date +%s)" \
+		--argjson up "${up:-0}" --argjson down "${down:-0}" \
+		--argjson speed_up "${speed_up:-0}" --argjson speed_down "${speed_down:-0}" \
+		--argjson since "${since:-0}" --argjson now "$now" \
 		--arg err "$err" --argjson other "$other" --argjson ip "$ipj" '
 		{ running:$running, connected:$ready, active:$active, up:$up, down:$down,
+		  speed_up:$speed_up, speed_down:$speed_down,
 		  uptime:(if $since>0 then ($now-$since) else 0 end), error:$err, other_singbox:$other, ip:$ip,
 			  phase:(if $ready then "on" elif $running then (if ($err|length)>0 then "error" else "starting" end) else (if ($err|length)>0 then "error" else "off" end) end) }'
 }

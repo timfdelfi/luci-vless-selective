@@ -51,6 +51,10 @@ selective_nft_conf() {
 	# поэтому старые адреса сами не исчезают — зато переподключение всегда чистит набор.
 	echo "  set $SEL_SET { type ipv4_addr; flags interval, timeout; auto-merge; }"
 	echo "  chain pre { type filter hook prerouting priority -150; policy accept;"
+	# Блокировка DoT (порт 853), чтобы смартфоны с «Частным DNS» автоматически откатывались
+	# на dnsmasq роутера, иначе их запросы идут мимо dnsmasq и не попадают в vpn4
+	echo "    tcp dport 853 reject with tcp reset"
+	echo "    udp dport 853 reject"
 	[ -n "$rule" ] && echo "    $rule"
 	echo "  }"
 	echo "}"

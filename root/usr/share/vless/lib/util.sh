@@ -88,6 +88,10 @@ lock() {
 unlock() { rm -rf "$LOCKDIR"; }
 locked() { # locked КОМАНДА [АРГУМЕНТЫ…]
 	lock || { json_err "Занято: выполняется другая операция. Повторите через минуту."; return 1; }
-	trap unlock EXIT
+	trap unlock EXIT INT TERM
 	"$@"
+	local rc=$?
+	unlock
+	trap - EXIT INT TERM
+	return $rc
 }

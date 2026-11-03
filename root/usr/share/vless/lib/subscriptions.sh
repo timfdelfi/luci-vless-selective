@@ -13,7 +13,13 @@ get_hwid() {
 	# пустой файл и записали разные HWID — панель увидела бы «новое устройство»
 	# и лимит устройств у пользователя сбрасывался бы.
 	if [ ! -s "$f" ]; then
-		( umask 077; tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16 > "$f.new" ) 2>/dev/null
+		( umask 077
+		  if [ -r /proc/sys/kernel/random/uuid ]; then
+		  	tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16 > "$f.new"
+		  else
+		  	( date +%s%N 2>/dev/null || date +%s ) | md5sum | cut -c1-16 > "$f.new"
+		  fi
+		) 2>/dev/null
 		if [ -s "$f.new" ]; then
 			[ -s "$f" ] || ln "$f.new" "$f" 2>/dev/null || mv "$f.new" "$f"
 			rm -f "$f.new"
@@ -216,7 +222,7 @@ cmd_add() {
 	# Текст можно передать аргументом (как раньше, для ручной отладки) или через stdin.
 	# rpcd-плагин передаёт именно через stdin: argv виден всем локальным пользователям
 	# в /proc/*/cmdline, а там — полные ключи и токены подписок.
-	if [ -n "$1" ]; then
+	if [ "$#" -gt 0 ]; then
 		text="$(printf '%s' "$1" | tr -d '\r')"
 	else
 		text="$(cat | tr -d '\r')"

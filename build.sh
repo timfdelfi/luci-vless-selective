@@ -19,7 +19,10 @@ if [ "${MINIFY:-0}" = 1 ]; then
 	sh ci/minify-js.sh "$W/htdocs/luci-static/resources/view/vless/main.js"
 	HT="$W/htdocs"
 fi
-rm -f "$OUT/vless-vpn.tar.gz" "$OUT/vless-vpn.zip" "$OUT/luci-vless-selective_${VER}_all.ipk"
+# Старые артефакты (в т. ч. .ipk прежних версий) не должны переживать пересборку.
+rm -f "$OUT"/vless-vpn.* "$OUT"/luci-vless-selective_*_all.ipk* "$OUT"/install.sh "$OUT"/SHA256SUMS
+# Отдельный install.sh нужен для установки одной строкой из релиза.
+sed 's/\r$//' install.sh > "$OUT/install.sh"
 
 # 1) универсальный установщик (opkg и apk)
 mkdir -p "$W/vless-vpn"
@@ -102,11 +105,11 @@ fi
 # Список файлов собирается циклом: «zip» может не собраться, и падать на этом
 # нельзя — остальные артефакты всё равно полезны.
 ( cd "$OUT" || exit 1
-	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk"; do
+	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk" install.sh; do
 		[ -f "$f" ] || continue
 		sha256sum "$f"
 	done > SHA256SUMS
-	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk"; do
+	for f in vless-vpn.tar.gz vless-vpn.zip "luci-vless-selective_${VER}_all.ipk" install.sh; do
 		if [ -f "$f" ]; then sha256sum "$f" > "$f.sha256"; fi
 	done )
 ls -l "$OUT"

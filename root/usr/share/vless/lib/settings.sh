@@ -16,6 +16,7 @@ settings_json() {
 		--arg mode "$(cfg mode all)" \
 		--arg dns_mode "$(cfg dns_mode vpn)" \
 		--arg remote_dns "$(cfg remote_dns 1.1.1.1)" \
+		--arg direct_dns "$(cfg direct_dns 'tls://77.88.8.8')" \
 		--arg bootstrap_dns "$(cfg bootstrap_dns 77.88.8.8)" \
 		--arg kill_switch "$(cfg kill_switch 0)" \
 		--arg block_quic "$(cfg block_quic 1)" \
@@ -34,7 +35,7 @@ settings_json() {
 		--arg auto_test_url "$(cfg auto_test_url 'https://www.gstatic.com/generate_204')" \
 		--arg dd "$dd" --arg dev "$dev" --arg ifs "${ifs:-lan}" \
 		'{ scope:$scope, presets:($pr|split(" ")|map(select(length>0))), proxy_domains:($pd|split(" ")|map(select(length>0))),
-		   mode:$mode, dns_mode:$dns_mode, remote_dns:$remote_dns, bootstrap_dns:$bootstrap_dns,
+		   mode:$mode, dns_mode:$dns_mode, remote_dns:$remote_dns, direct_dns:$direct_dns, bootstrap_dns:$bootstrap_dns,
 		   kill_switch:($kill_switch=="1"), block_quic:($block_quic=="1"), block_ipv6:($block_ipv6=="1"), bypass_vpn:($bypass_vpn=="1"),
 		   bypass_ru:($bypass_ru=="1"), tun_stack:$tun_stack, mtu:(try ($mtu|tonumber) catch 1400), log_level:$log_level,
 		   discord_mode:$discord_mode, discord_offload:($discord_offload=="1"),
@@ -58,7 +59,7 @@ cmd_set() {
 	# скаляры
 	printf '%s\n' "$data" | jq -r '
 		def b: if . == true then "1" elif . == false then "0" else . end;
-		[ "scope","mode","dns_mode","remote_dns","bootstrap_dns","kill_switch","block_quic","block_ipv6","bypass_ru","bypass_vpn",
+		[ "scope","mode","dns_mode","remote_dns","direct_dns","bootstrap_dns","kill_switch","block_quic","block_ipv6","bypass_ru","bypass_vpn",
 		  "tun_stack","mtu","log_level","user_agent","update_interval","selected",
 		  "auto_interval","auto_tolerance","auto_test_url","discord_mode","discord_offload" ] as $keys
 		| $keys[] as $k | select(has($k)) | "\($k)\t\(.[$k] | b | tostring)"' | tr -d '\r' |
@@ -70,7 +71,8 @@ cmd_set() {
 			dns_mode)       case "$v" in vpn|system) ;; *) bad=1 ;; esac ;;
 			tun_stack)      case "$v" in system|gvisor|mixed) ;; *) bad=1 ;; esac ;;
 			log_level)      case "$v" in trace|debug|info|warn|error) ;; *) bad=1 ;; esac ;;
-			remote_dns|bootstrap_dns) valid_ip "$v" || bad=1 ;;
+			remote_dns|direct_dns) valid_dns_server "$v" || bad=1 ;;
+			bootstrap_dns)  valid_ip "$v" || bad=1 ;;
 			kill_switch|block_quic|block_ipv6|bypass_ru|bypass_vpn|discord_offload) case "$v" in 0|1) ;; *) bad=1 ;; esac ;;
 			discord_mode)   case "$v" in off|auto|zapret|vpn) ;; *) bad=1 ;; esac ;;
 			mtu)            { echo "$v" | grep -qE '^[0-9]{4}$' && [ "$v" -ge 1000 ] && [ "$v" -le 9000 ]; } || bad=1 ;;
@@ -138,3 +140,60 @@ cmd_set() {
 	fi
 	jq -n -c --rawfile r "$rej" '{ok:true, ignored:($r | split("\n") | map(select(length > 0)))}'
 }
+
+# ---------------------------------------------------------------- экспорт и импорт
+
+cmd_export() {
+	local srv src hid st
+	[ -s "$SERVERS" ] && srv="$(cat "$SERVERS")" || srv='[]'
+	[ -s "$SOURCES" ] && src="$(cat "$SOURCES")" || src='[]'
+	[ -s "$HIDDEN" ] && hid="$(cat "$HIDDEN")" || hid='[]'
+	st="$(settings_json)"
+	jq -n -c \
+		--argjson v 1 \
+		--argjson now "$(date +%s)" \
+		--argjson settings "$st" \
+		--argjson sources "$src" \
+		--argjson servers "$srv" \
+		--argjson hidden "$hid" \
+		'{ok:true,version:$v,created:$now,settings:$settings,sources:$sources,servers:$servers,hidden:$hidden}'
+}
+
+cmd_import() {
+	local in data srv src hid
+	in="$(cat)"
+	if printf '%s' "$in" | jq -e '.backup and (.backup | type=="object")' >/dev/null 2>&1; then
+		data="$(printf '%s' "$in" | jq -c '.backup')"
+	elif printf '%s' "$in" | jq -e '.backup and (.backup | type=="string")' >/dev/null 2>&1; then
+		data="$(printf '%s' "$in" | jq -r '.backup' | jq -c . 2>/dev/null)"
+	else
+		data="$in"
+	fi
+	printf '%s' "$data" | jq -e 'type=="object" and (has("servers") or has("settings"))' >/dev/null 2>&1 || {
+		json_err "Некорректный файл резервной копии"
+		return 1
+	}
+
+	if printf '%s' "$data" | jq -e '.servers | type=="array"' >/dev/null 2>&1; then
+		srv="$(printf '%s' "$data" | jq -c '.servers')"
+		atomic_text "$SERVERS" "$srv" || { json_err "Не удалось восстановить серверы"; return 1; }
+	fi
+
+	if printf '%s' "$data" | jq -e '.sources | type=="array"' >/dev/null 2>&1; then
+		src="$(printf '%s' "$data" | jq -c '.sources')"
+		atomic_text "$SOURCES" "$src" || { json_err "Не удалось восстановить подписки"; return 1; }
+	fi
+
+	if printf '%s' "$data" | jq -e '.hidden | type=="array"' >/dev/null 2>&1; then
+		hid="$(printf '%s' "$data" | jq -c '.hidden')"
+		atomic_text "$HIDDEN" "$hid" || true
+	fi
+
+	if printf '%s' "$data" | jq -e '.settings | type=="object"' >/dev/null 2>&1; then
+		printf '%s' "$data" | jq -c '.settings' | cmd_set >/dev/null 2>&1
+	fi
+
+	restart_if_running
+	jq -n -c '{ok:true}'
+}
+
