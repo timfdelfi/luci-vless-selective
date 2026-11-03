@@ -3,7 +3,6 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — по `VERSION`.
 Что делать при выпуске, написано в [CONTRIBUTING.md](CONTRIBUTING.md#релиз-для-мейнтейнера).
 
-## [Не выпущено]
 
 ## [1.3.8]
 
