@@ -1574,7 +1574,7 @@ return view.extend({
 		var routeTestResult = E('div', { 'class': 'hv-route-res', style: 'display:none;margin-top:12px;padding:12px;border-radius:var(--r);background:var(--card2);border:1px solid var(--line);' });
 
 		var routeTestIcon = ic('search');
-		var routeTestLabel = E('span', {}, _('Проверить'));
+		var routeTestLabel = E('span', {}, 'Проверить');
 		var routeTestBtn = E('button', {
 			type: 'button', 'class': 'hv-btn sec',
 			style: 'flex:none;white-space:nowrap;',
@@ -1583,13 +1583,13 @@ return view.extend({
 				if (!val) { self.toast('Введите домен или IP-адрес для проверки', true); return; }
 				routeTestBtn.disabled = true;
 				routeTestBtn.classList.add('spin');
-				routeTestLabel.textContent = _('Проверка…');
+				routeTestLabel.textContent = 'Проверка…';
 				routeTestResult.style.display = 'none';
 
 				var done = function () {
 					routeTestBtn.disabled = false;
 					routeTestBtn.classList.remove('spin');
-					routeTestLabel.textContent = _('Проверить');
+					routeTestLabel.textContent = 'Проверить';
 				};
 
 				rTestRoute(val).then(function (res) {

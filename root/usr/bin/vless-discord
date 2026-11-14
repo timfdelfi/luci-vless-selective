@@ -338,6 +338,7 @@ verify_sha256() {
 }
 
 # Каталоги бинарников zapret для архитектуры роутера (в разных релизах имена разные)
+# shellcheck disable=SC2120
 arch_dirs() {
 	local a="$1"
 	[ -n "$a" ] || a="${DISTRIB_ARCH:-}"
