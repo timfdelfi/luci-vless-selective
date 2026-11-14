@@ -48,12 +48,14 @@ case "$1" in
 	"check":      {},
 	"ping":       { "id": "string" },
 	"ping-direct": { "id": "string" },
+	"test-route":  { "target": "string" },
 	"clear":      {},
 	"clearlog":   {},
 	"add":        { "text": "string" },
 	"remove":     { "id": "string" },
 	"refresh":    { "id": "string" },
 	"select":     { "id": "string" },
+	"select-ai":  { "id": "string" },
 	"set":        { "settings": "object" },
 	"export":     {},
 	"import":     { "backup": "object" },
@@ -83,10 +85,12 @@ JSON
 				else
 					run fetch-core
 				fi ;;
-			ping|remove|refresh|select)
+			ping|remove|refresh|select|select-ai)
 				run "$2" "$(arg id)" ;;
 			ping-direct)
 				run ping-direct "$(arg id)" ;;
+			test-route)
+				run test-route "$(arg target)" ;;
 			add)
 				# Текст со ссылками идёт через stdin, а не через аргумент командной строки:
 				# argv виден всем локальным пользователям в /proc/*/cmdline, а там —

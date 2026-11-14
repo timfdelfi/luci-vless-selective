@@ -30,7 +30,10 @@ effective_settings() {
 		elif $act == "zapret" then
 			(.direct_domains = ((.direct_domains + $dom) | unique) | .presets = (.presets - ["discord"]) | .zapret_udp = true)
 		elif $act == "vpn" then (.presets = ((.presets + ["discord"]) | unique))
-		else . end'
+		else . end
+		| if (.ai_selected // "same") != "same" and .scope == "selected" then
+			.presets = ((.presets + ["ai"]) | unique)
+		  else . end'
 }
 eff() { effective_settings | jq -r --arg k "$1" '.[$k] | if type == "array" then join(" ") else tostring end'; }
 

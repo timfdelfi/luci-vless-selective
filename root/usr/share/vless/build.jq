@@ -41,7 +41,9 @@ def parse_dns($val; $default_type; $default_srv):
       ($v | ltrimstr("tls://")) as $raw
       | ($raw | split(":")[0]) as $host
       | ($raw | split(":")[1]) as $port
-      | { type: "tls", server: $host } + (if $port then { server_port: ($port | tonumber) } else {} end)
+      | { type: "tls", server: $host }
+        + (if ($host | is_domainlike) then { domain_resolver: "dns-bootstrap" } else {} end)
+        + (if $port then { server_port: ($port | tonumber) } else {} end)
     elif ($v | startswith("https://")) then
       ($v | ltrimstr("https://")) as $raw
       | ($raw | split("/")[0]) as $hp
@@ -49,6 +51,7 @@ def parse_dns($val; $default_type; $default_srv):
       | ($hp | split(":")[0]) as $host
       | ($hp | split(":")[1]) as $port
       | { type: "https", server: $host, path: $path }
+        + (if ($host | is_domainlike) then { domain_resolver: "dns-bootstrap" } else {} end)
         + (if $port then { server_port: ($port | tonumber) } else {} end)
     elif ($v | startswith("udp://")) then
       ($v | ltrimstr("udp://")) as $raw
@@ -64,6 +67,10 @@ def parse_dns($val; $default_type; $default_srv):
 | if ($list | length) == 0 then error("Нет ни одного поддерживаемого сервера") else . end
 | ($list | map("s-" + .id)) as $tags
 | (if $selected != "auto" and ($tags | index("s-" + $selected)) != null then "s-" + $selected else "auto" end) as $default
+| ($s.ai_selected // "same") as $ai_sel
+| (if $ai_sel == "auto" then "auto"
+   elif $ai_sel != "same" and ($tags | index("s-" + $ai_sel)) != null then "s-" + $ai_sel
+   else "proxy" end) as $ai_default
 | ($list | map(.server) | unique | map(select(is_domainlike))) as $vpn_hosts
 
 # исключения пользователя (всегда напрямую)
@@ -71,13 +78,15 @@ def parse_dns($val; $default_type; $default_srv):
 | ($dd | map(select(is_domainlike))) as $dd_domains
 | ($dd | map(select(is_ip))) as $dd_ips
 
-# режим «только выбранное»
+# режим «только выбранное» и правила для нейросетей/ИИ
 | (($s.scope // "all") == "selected") as $sel
 | presets as $PS
 | ($s.presets // [] | map(select(type == "string"))) as $keys
 | ($s.proxy_domains // [] | map(select(type == "string" and length > 0)) | map(plain)) as $pd
 | ([ $keys[] as $k | ($PS[$k].domains // [])[] ] + ($pd | map(select(is_domainlike))) | unique) as $sel_domains
 | ([ $keys[] as $k | ($PS[$k].cidrs // [])[] ] + ($pd | map(select(is_ip))) | unique) as $sel_cidrs
+| ($PS["ai"].domains // []) as $ai_domains
+| ($ai_sel != "same" or ($sel and ($keys | index("ai")) != null)) as $route_ai
 | ($s.block_quic != false) as $quic
 
 | {
@@ -94,6 +103,7 @@ def parse_dns($val; $default_type; $default_srv):
          | if ($dh | is_domainlike) then [{ domain: [$dh], server: "dns-bootstrap" }] else [] end)
         + (if ($vpn_hosts | length) > 0 then [{ domain: $vpn_hosts, server: "dns-direct" }] else [] end)
         + (if ($dd_domains | length) > 0 then [{ domain_suffix: $dd_domains, server: "dns-direct" }] else [] end)
+        + (if $route_ai and ($ai_domains | length) > 0 then [{ domain_suffix: $ai_domains, server: "dns-remote" }] else [] end)
         + (if $sel then
              # выбранные сайты резолвим через VPN, остальные — напрямую
              (if ($sel_domains | length) > 0 then [{ domain_suffix: $sel_domains, server: "dns-remote" }] else [] end)
@@ -115,6 +125,7 @@ def parse_dns($val; $default_type; $default_srv):
 
     outbounds: (
       [ { type: "selector", tag: "proxy", outbounds: (["auto"] + $tags), default: $default },
+        { type: "selector", tag: "ai-proxy", outbounds: (["proxy", "auto"] + $tags), default: $ai_default },
         { type: "urltest", tag: "auto", outbounds: $tags,
           url: ($s.auto_test_url // "https://www.gstatic.com/generate_204"),
           interval: ($s.auto_interval // "3m"), tolerance: ($s.auto_tolerance // 80) } ]
@@ -128,15 +139,22 @@ def parse_dns($val; $default_type; $default_srv):
           { action: "sniff" },
           { protocol: "dns", action: "hijack-dns" },
           { ip_is_private: true, outbound: "direct" } ]
+        # Прямой пропуск клиентских VPN на устройствах локальной сети (WireGuard, OpenVPN, IPsec, Tailscale, WARP)
+        + (if ($s.bypass_vpn != false) then
+             [ { network: "udp", port: [500, 1194, 1701, 2408, 4500, 51820, 41641], outbound: "direct" },
+               { network: "tcp", port: [1194, 1723], outbound: "direct" } ]
+           else [] end)
         + (if ($dd_ips | length) > 0 then [{ ip_cidr: $dd_ips, outbound: "direct" }] else [] end)
         + (if ($dd_domains | length) > 0 then [{ domain_suffix: $dd_domains, outbound: "direct" }] else [] end)
-        # Discord идёт через zapret (nfqws): голос и демонстрация экрана — UDP на этих портах, домена у них нет,
-        # поэтому без правила по портам они ушли бы в VPN вместе со всем остальным.
-        + (if ($s.zapret_udp == true) then [{ network: "udp", port_range: ["19294:19344", "50000:50100"], outbound: "direct" }] else [] end)
+        # Discord: голос и демонстрация экрана — UDP 19294:19344 и 50000:65535, напрямую мимо туннеля
+        + (if ($s.zapret_udp == true) then [{ network: "udp", port_range: ["19294:19344", "50000:50100", "50101:65535"], outbound: "direct" }] else [] end)
+        # Выделенный сервер / маршрут для ИИ и нейросетей (Antigravity, Gemini, ChatGPT, Claude и др.)
+        + (if $route_ai and ($ai_domains | length) > 0 then [{ domain_suffix: $ai_domains, outbound: "ai-proxy" }] else [] end)
         + (if $sel then
              # режем QUIC только у тех, кто идёт через VPN; остальной трафик не трогаем
              (if $quic and ($sel_domains | length) > 0 then [{ network: "udp", port: 443, domain_suffix: $sel_domains, action: "reject" }] else [] end)
              + (if $quic and ($sel_cidrs | length) > 0 then [{ network: "udp", port: 443, ip_cidr: $sel_cidrs, action: "reject" }] else [] end)
+             + (if $quic and $route_ai and ($ai_domains | length) > 0 then [{ network: "udp", port: 443, domain_suffix: $ai_domains, action: "reject" }] else [] end)
              + (if ($sel_domains | length) > 0 then [{ domain_suffix: $sel_domains, outbound: "proxy" }] else [] end)
              + (if ($sel_cidrs | length) > 0 then [{ ip_cidr: $sel_cidrs, outbound: "proxy" }] else [] end)
            else

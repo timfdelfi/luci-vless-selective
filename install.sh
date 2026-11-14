@@ -167,7 +167,7 @@ free_kb="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
 [ -n "$free_kb" ] && [ "$free_kb" -lt 30000 ] && warn "Свободного места мало (${free_kb} КБ). sing-box занимает около 20–35 МБ."
 
 say "Устанавливаю зависимости ($PM)"
-DEPS="sing-box kmod-tun curl jq ca-bundle ip-full nftables kmod-nft-queue kmod-nfnetlink-queue"
+DEPS="sing-box kmod-tun curl jq ca-bundle ip-full nftables"
 if [ "$PM" = apk ]; then
 	apk update >/dev/null 2>&1
 	for p in $DEPS; do apk info -e "$p" >/dev/null 2>&1 || apk add "$p" || warn "Не удалось установить $p"; done

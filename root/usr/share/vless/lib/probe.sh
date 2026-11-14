@@ -188,20 +188,173 @@ cmd_ping_direct() { # ping_direct [ID] — прямой пинг без VPN
 	rm -f "$RUN/pingtab"
 	join_all
 	cat "$RUN"/pingd.* 2>/dev/null > "$RUN/pingres"
-	while IFS="$TAB" read -r id ms; do
-		[ -n "$id" ] || continue
-		if [ "$ms" = "FAIL" ] || [ -z "$ms" ]; then
-			result="$(printf '%s' "$result" | jq -c --arg id "$id" 'del(.[$id])')"
-		else
-			result="$(printf '%s' "$result" | jq -c --arg id "$id" --argjson d "$ms" '. + {($id):$d}')"
-		fi
-	done < "$RUN/pingres"
+	local result
+	result="$(awk -F'\t' '$2 != "FAIL" && $2 != "" { printf "%s\t%s\n", $1, $2 }' "$RUN/pingres" 2>/dev/null | \
+		jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t")) | map({ (.[0]): (.[1] | tonumber) }) | add // {}')"
 	rm -f "$RUN/pingres"
 	rm -f "$RUN"/pingd.*
+	[ -n "$result" ] || result="{}"
 	atomic_text "$RUN/delays.json" "$result"
 	# Как и в cmd_ping: если не ответил никто — это честная неудача, а не «обновилось».
 	n="$(printf '%s' "$result" | jq -r 'length')"
 	jq -n -c --slurpfile d "$RUN/delays.json" --argjson n "$n" \
 		'(if $n == 0 then {ok:false,error:"Ни один сервер не ответил напрямую (проверьте подключение к интернету)"}
 		  else {ok:true,delays:$d[0],count:$n} end) + {direct:true}'
+}
+
+cmd_test_route() { # test-route TARGET
+	local raw="$1" target
+	raw="$(printf '%s' "$raw" | tr -d '\r\n')"
+	[ -n "$raw" ] || { json_err "Укажите домен или адрес для проверки"; return 0; }
+	# Убираем схему, путь, порт, пробелы
+	target="$(printf '%s' "$raw" | sed -E 's#^[a-zA-Z0-9+.-]+://##; s#/.*##; s#:.*##' | tr -d ' ' | tr 'A-Z' 'a-z')"
+	[ -n "$target" ] || { json_err "Некорректный адрес для проверки"; return 0; }
+
+	local s servers delays act="off"
+	s="$(effective_settings 2>/dev/null)" || s="{}"
+	servers="$(cat "$SERVERS" 2>/dev/null)" || servers="[]"
+	delays="$(cat "$RUN/delays.json" 2>/dev/null)" || delays="{}"
+	act="$(discord_active 2>/dev/null || echo off)"
+
+	local route_info
+	route_info="$(jq -n -c -L "$LIB" \
+		--arg target "$target" \
+		--argjson s "$s" \
+		--argjson servers "$servers" \
+		--argjson delays "$delays" \
+		--arg act "$act" '
+		include "presets";
+
+		def ru_suffixes: [
+			".ru", ".su", ".xn--p1ai", ".xn--80asehdb", ".xn--80aswg",
+			"yandex.net", "yandex.com", "yastatic.net", "ya.cc",
+			"vk.com", "vk.me", "vkuser.net", "userapi.com", "vk-cdn.net", "vkontakte.ru",
+			"sberbank.com", "mail.ru", "ok.ru", "mycdn.me", "tinkoff.ru", "kinopoisk.ru",
+			"avito.st", "ozon.ru", "wb.ru", "wildberries.ru", "gosuslugi.ru", "mos.ru"
+		];
+
+		def match_domain($t; $list):
+			($list // []) | any(
+				. as $item
+				| ($item | ltrimstr("*.")) as $c
+				| ($t == $c or ($t | endswith("." + $c)))
+			);
+
+		def match_ip($t; $list):
+			($list // []) | any(
+				. as $item
+				| ($item | split("/")[0]) as $base
+				| ($t == $item or $t == $base)
+			);
+
+		def is_priv_ip($t):
+			($t | startswith("10.")) or
+			($t | startswith("192.168.")) or
+			($t | startswith("127.")) or
+			($t == "::1") or
+			($t | startswith("172.16.")) or ($t | startswith("172.17.")) or ($t | startswith("172.18.")) or
+			($t | startswith("172.19.")) or ($t | startswith("172.20.")) or ($t | startswith("172.21.")) or
+			($t | startswith("172.22.")) or ($t | startswith("172.23.")) or ($t | startswith("172.24.")) or
+			($t | startswith("172.25.")) or ($t | startswith("172.26.")) or ($t | startswith("172.27.")) or
+			($t | startswith("172.28.")) or ($t | startswith("172.29.")) or ($t | startswith("172.30.")) or
+			($t | startswith("172.31."));
+
+		presets as $PS
+		| ($PS.ai.domains // []) as $ai_doms
+		| ($PS.discord.domains // []) as $dc_doms
+		| ($PS.discord.cidrs // []) as $dc_cidrs
+		| ($s.direct_domains // []) as $dd
+		| ($s.proxy_domains // []) as $pd
+		| ($s.presets // []) as $user_presets
+		| ($s.scope // "all") as $scope
+		| ($s.ai_selected // "same") as $ai_sel
+		| ($s.selected // "auto") as $main_sel
+
+		| if is_priv_ip($target) then
+			{ route: "direct", label: "Напрямую (LAN)", rule: "Локальная сеть (частный IP-адрес)", outbound: "direct", server: null }
+		  elif match_domain($target; $dd) or match_ip($target; $dd) then
+			{ route: "direct", label: "Напрямую", rule: "Свои исключения (всегда напрямую)", outbound: "direct", server: null }
+		  elif match_domain($target; $dc_doms) or match_ip($target; $dc_cidrs) then
+			if $act == "zapret" then
+				{ route: "zapret", label: "Zapret (nfqws)", rule: "Discord через zapret (прямой обход DPI без VPN)", outbound: "direct", server: null }
+			elif $act == "vpn" or ($s.discord_mode // "off") == "vpn" then
+				{ route: "proxy", label: "Основной VPN", rule: "Discord через VPN (запасной путь)", outbound: "proxy" }
+			elif $scope == "selected" and ($user_presets | index("discord")) == null then
+				{ route: "direct", label: "Напрямую", rule: "Режим «Только выбранные»: Discord не отмечен", outbound: "direct", server: null }
+			else
+				{ route: "proxy", label: "Основной VPN", rule: "Discord через VPN (пресет)", outbound: "proxy" }
+			end
+		  elif match_domain($target; $ai_doms) then
+			if $ai_sel != "same" then
+				{ route: "ai-proxy", label: "Выделенный сервер для ИИ", rule: "Пресет: ИИ и нейросети (отдельный сервер)", outbound: "ai-proxy", is_ai: true }
+			elif $scope == "selected" and ($user_presets | index("ai")) == null and (match_domain($target; $pd) | not) then
+				{ route: "direct", label: "Напрямую", rule: "Режим «Только выбранные»: сервис ИИ не отмечен", outbound: "direct", server: null, is_ai: true }
+			else
+				{ route: "proxy", label: "Основной VPN", rule: "Пресет: ИИ и нейросети (через основной VPN)", outbound: "proxy", is_ai: true }
+			end
+		  elif $scope == "selected" then
+			( [ $user_presets[] as $k | { key: $k, hit: (match_domain($target; ($PS[$k].domains // [])) or match_ip($target; ($PS[$k].cidrs // []))) } ]
+			  | map(select(.hit == true)) | .[0].key ) as $matched_preset
+			| if $matched_preset != null then
+				{ route: "proxy", label: "Основной VPN", rule: ("Пресет: " + $matched_preset), outbound: "proxy" }
+			  elif match_domain($target; $pd) or match_ip($target; $pd) then
+				{ route: "proxy", label: "Основной VPN", rule: "Свои сайты через VPN", outbound: "proxy" }
+			  else
+				{ route: "direct", label: "Напрямую", rule: "Режим «Только выбранные»: сайт не в списке", outbound: "direct", server: null }
+			  end
+		  elif $s.bypass_ru == true and (match_domain($target; ru_suffixes) or ($target | endswith(".ru")) or ($target | endswith(".su")) or ($target | endswith(".рф")) or ($target | endswith(".xn--p1ai"))) then
+			{ route: "direct", label: "Напрямую", rule: "Российский сервис (.ru / РФ) мимо VPN", outbound: "direct", server: null }
+		  else
+			{ route: "proxy", label: "Основной VPN", rule: "Основной маршрут VPN (весь трафик)", outbound: "proxy" }
+		  end
+		| . as $r
+		| if $r.outbound == "ai-proxy" or $r.outbound == "proxy" then
+			(if $r.outbound == "ai-proxy" then $ai_sel else $main_sel end) as $wanted
+			| ($servers | map(select(.supported == true and .outbound != null))) as $sup
+			| (if $wanted != "auto" and $wanted != "same" then
+				($sup | map(select(.id == $wanted)) | .[0])
+			   else
+				($sup | sort_by(($delays[.id] // 999999)) | .[0])
+			   end) as $srv
+			| $r + {
+				target: $target,
+				server: (if $srv then { id: $srv.id, name: $srv.name, host: $srv.server, port: ($srv.port // $srv.server_port // 443), proto: ($srv.proto // "vless"), sec: ($srv.sec // "none") } else null end),
+				is_auto: ($wanted == "auto")
+			  }
+		  else
+			$r + { target: $target }
+		  end
+	')"
+
+	[ -n "$route_info" ] || { json_err "Ошибка анализа маршрута"; return 0; }
+
+	local ob srv_host srv_port srv_proto srv_sec ms="" id=""
+	ob="$(printf '%s' "$route_info" | jq -r '.outbound // "direct"')"
+
+	if [ "$ob" = "ai-proxy" ] || [ "$ob" = "proxy" ]; then
+		srv_host="$(printf '%s' "$route_info" | jq -r '.server.host // empty')"
+		srv_port="$(printf '%s' "$route_info" | jq -r '.server.port // 443')"
+		srv_proto="$(printf '%s' "$route_info" | jq -r '.server.proto // "vless"')"
+		srv_sec="$(printf '%s' "$route_info" | jq -r '.server.sec // "none"')"
+		id="$(printf '%s' "$route_info" | jq -r '.server.id // empty')"
+
+		if is_ready && [ -n "$id" ]; then
+			local r delay_val
+			r="$(T=5 api GET "/proxies/s-$id/delay?url=$PING_URL&timeout=4000" 2>/dev/null)"
+			delay_val="$(printf '%s' "$r" | jq -r '.delay // empty' 2>/dev/null)"
+			[ -n "$delay_val" ] && ms="$delay_val"
+		fi
+		[ -n "$ms" ] || ms="$(ping_one_direct "$srv_host" "$srv_port" "$srv_proto" "$srv_sec" 2>/dev/null)"
+	else
+		ms="$(ping_one_direct "$target" 443 tcp tls 2>/dev/null)"
+		[ -n "$ms" ] || ms="$(ping_one_direct "$target" 80 tcp none 2>/dev/null)"
+	fi
+
+	local vpn_on=false
+	is_running && vpn_on=true
+
+	printf '%s' "$route_info" | jq -c \
+		--argjson ping "${ms:-null}" \
+		--argjson vpn_running "$vpn_on" \
+		'. + { ok: true, ping: $ping, vpn_running: $vpn_running }'
 }

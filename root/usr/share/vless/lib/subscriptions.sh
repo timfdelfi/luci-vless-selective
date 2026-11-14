@@ -53,11 +53,11 @@ fetch_url() {
 }
 
 # is_stub — в только что разобранной подписке лежит заглушка вида
-# «Ваш клиент VPN не поддерживается» (панель не узнала приложение)
+# «Ваш клиент VPN не поддерживается» или «Достигнут лимит устройств»
 is_stub() {
 	[ "$1" -le 2 ] || return 1
 	jq -r '.name // empty' "$RUN/new.jsonl" 2>/dev/null | tr 'A-Z' 'a-z' |
-		grep -qE 'не поддерж|не подде|unsupported|not supported|update (your )?(app|client)|обновите|устарел'
+		grep -qE 'не поддерж|не подде|unsupported|not supported|update (your )?(app|client)|обновите|устарел|лимит|limit|превышен'
 }
 
 # base64 без регулярных выражений: на многих роутерах jq собран без Oniguruma.
@@ -125,10 +125,10 @@ ingest() {
 }
 
 merge_servers() { # merge_servers SRC MODE(replace|append)  — удалённые пользователем серверы не возвращаются
-	local flt='map(select(.id as $i | ($hid | map(.id) | index($i)) | not))'
+	local flt='(($hid | reduce .[] as $h ({}; .[$h.id] = 1)) as $hmap | map(select($hmap[.id] == null)))'
 	# Дедупликация БЕЗ сортировки: unique_by() переставлял бы весь список,
 	# потому что id — это md5, и сервера «прыгали» бы при каждом обновлении.
-	local ud='def ud: reduce .[] as $x ([]; if any(.[]; .id == $x.id) then . else . + [$x] end); '
+	local ud='def ud: reduce .[] as $x ({seen:{}, list:[]}; if .seen[$x.id] then . else {seen: (.seen + {($x.id): 1}), list: (.list + [$x])} end) | .list; '
 	if [ "$2" = "replace" ]; then
 		atomic_run "$SERVERS" jq -c -s --arg src "$1" --slurpfile h "$HIDDEN" "$ud"'($h[0] // []) as $hid | ((.[0] | map(select(.source != $src))) + (.[1:] | ud)) | '"$flt" "$SERVERS" "$RUN/new.jsonl"
 	else
@@ -155,7 +155,9 @@ add_sub() { # add_sub URL
 	fi
 	n="$(body_to_tsv "$body" | ingest "$sid")"
 	if [ "$n" -gt 0 ] && is_stub "$n"; then
-		json_err "Панель подписки не признала клиент и вернула заглушку «не поддерживается». Проверьте User-Agent в «Настройки → DNS и сеть» (должен быть вида Happ/3.13.0) или лимит устройств в подписке (HWID роутера: $(get_hwid))."
+		local stub_name
+		stub_name="$(jq -r '.name // empty' "$RUN/new.jsonl" 2>/dev/null | head -n1)"
+		json_err "Панель подписки вернула заглушку «${stub_name:-не поддерживается}». Проверьте User-Agent в «Настройки → DNS и сеть» (должен быть вида Happ/4.6.1) или лимит устройств в подписке (HWID роутера: $(get_hwid))."
 		rm -f "$body" "$hf" "$RUN/new.jsonl"
 		return 1
 	fi
@@ -173,7 +175,7 @@ add_sub() { # add_sub URL
 
 	upsert_source "$(jq -n -c --arg id "$sid" --arg url "$url" --arg name "$title" --arg info "$info" \
 		--arg support "$(hdr "$hf" support-url)" --arg page "$(hdr "$hf" profile-web-page-url)" --argjson now "$now" --argjson n "$n" '
-		def kv($k): ($info | split(";") | map(split("=") | { key: (.[0] | ltrimstr(" ")), value: (.[1] // "") })
+		def kv($k): ($info | split(";") | map(split("=") | { key: (.[0] | ltrimstr(" ") | rtrimstr(" ")), value: (.[1] // "" | ltrimstr(" ") | rtrimstr(" ")) })
 			| map(select(.key == $k)) | (.[0].value // "") | (tonumber? // null));
 		{ id:$id, kind:"sub", url:$url, name:$name, updated:$now, count:$n,
 		  upload:(try kv("upload") catch null), download:(try kv("download") catch null),
@@ -192,7 +194,7 @@ add_links() { # add_links TEXT
 	n="$(body_to_tsv "$RUN/links.in" | ingest manual)"
 	rm -f "$RUN/links.in"
 	if [ "$n" -eq 0 ]; then
-		json_err "Не удалось распознать ссылку. Поддерживаются vless://, vmess://, trojan://, ss://, hysteria2:// и адреса подписок (https://…).$(pe="$(parse_err)"; [ -n "$pe" ] && echo " Ошибка разбора: $pe")"
+		json_err "Не удалось распознать ссылку. Поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://, hysteria:// и адреса подписок (https://…).$(pe="$(parse_err)"; [ -n "$pe" ] && echo " Ошибка разбора: $pe")"
 		return 1
 	fi
 	merge_servers manual append
@@ -212,7 +214,7 @@ unwrap_link() {
 		vless://add/http*|vless://import/http*) printf '%s' "${1#vless://*/}" ;;
 		clash://install-config?url=*|sing-box://import-remote-profile?url=*)
 			u="${1#*url=}"; u="${u%%&*}"
-			printf '%s' "$u" | sed 's/%3A/:/Ig;s/%2F/\//Ig;s/%3F/?/Ig;s/%3D/=/Ig;s/%26/\&/Ig' ;;
+			printf '%s' "$u" | sed 's/%[3][aA]/:/g;s/%[2][fF]/\//g;s/%[3][fF]/?/g;s/%[3][dD]/=/g;s/%[2][6]/\&/g' ;;
 		*) printf '%s' "$1" ;;
 	esac
 }
@@ -236,8 +238,35 @@ cmd_add() {
 		text="$(unwrap_link "$text")"
 	fi
 	[ -n "$text" ] || { json_err "Вставьте ссылку"; return 1; }
-	if printf '%s' "$text" | grep -qE '^https?://[^[:space:]]+$'; then
+	local lcnt
+	lcnt="$(printf '%s\n' "$text" | wc -l)"
+	if [ "$lcnt" -eq 1 ] && printf '%s' "$text" | grep -qE '^https?://[^[:space:]]+$'; then
 		res="$(add_sub "$text")"
+	elif printf '%s\n' "$text" | grep -qE '^https?://'; then
+		# Несколько строк, содержащих ссылки на подписки (или смесь с ключами)
+		local sub_urls link_lines total_added=0 sub_ok=0 last_sub_res="" links_res="" u
+		sub_urls="$(printf '%s\n' "$text" | grep -E '^https?://[^[:space:]]+$')"
+		link_lines="$(printf '%s\n' "$text" | grep -vE '^https?://')"
+		for u in $sub_urls; do
+			[ -n "$u" ] || continue
+			last_sub_res="$(add_sub "$u")"
+			if [ "$(printf '%s' "$last_sub_res" | jq -r '.ok')" = "true" ]; then
+				sub_ok=$((sub_ok + 1))
+				total_added=$((total_added + $(printf '%s' "$last_sub_res" | jq -r '.added // 0')))
+			fi
+		done
+		if [ -n "$link_lines" ] && printf '%s\n' "$link_lines" | grep -q '://'; then
+			links_res="$(add_links "$link_lines")"
+			if [ "$(printf '%s' "$links_res" | jq -r '.ok')" = "true" ]; then
+				total_added=$((total_added + $(printf '%s' "$links_res" | jq -r '.added // 0')))
+			fi
+		fi
+		if [ "$sub_ok" -gt 0 ] || [ "$total_added" -gt 0 ]; then
+			res="$(jq -n -c --argjson n "$total_added" '{ok:true,added:$n,kind:"multi"}')"
+		else
+			res="${last_sub_res:-$links_res}"
+			[ -n "$res" ] || res="$(json_err "Не удалось распознать ссылки или подписки")"
+		fi
 	else
 		res="$(add_links "$text")"
 	fi
@@ -356,6 +385,10 @@ cmd_remove() { # remove ID (источник или одиночный серв�
 	if [ "$sel" != "auto" ] && [ "$(jq --arg s "$sel" '[.[]|select(.id==$s)]|length' "$SERVERS")" = "0" ]; then
 		uci set vless.main.selected=auto; uci commit vless
 	fi
+	asel="$(cfg ai_selected same)"
+	if [ "$asel" != "same" ] && [ "$asel" != "auto" ] && [ "$(jq --arg s "$asel" '[.[]|select(.id==$s)]|length' "$SERVERS")" = "0" ]; then
+		uci set vless.main.ai_selected=same; uci commit vless
+	fi
 	if [ "$(jq 'length' "$SERVERS")" = "0" ] && is_running; then
 		/etc/init.d/vless stop >/dev/null 2>&1
 	else
@@ -366,7 +399,7 @@ cmd_remove() { # remove ID (источник или одиночный серв�
 
 cmd_clear() {
 	atomic_text "$SERVERS" '[]'; atomic_text "$SOURCES" '[]'; atomic_text "$HIDDEN" '[]'
-	uci set vless.main.selected=auto; uci commit vless
+	uci set vless.main.selected=auto; uci set vless.main.ai_selected=same; uci commit vless
 	is_running && /etc/init.d/vless stop >/dev/null 2>&1
 	jq -n -c '{ok:true}'
 }
@@ -381,4 +414,16 @@ cmd_select() { # select ID|auto
 		rm -f "$RUN/ip.json"
 	fi
 	jq -n -c --arg id "$id" '{ok:true,selected:$id}'
+}
+
+cmd_select_ai() { # select-ai same|auto|ID
+	local id="$1"
+	echo "$id" | grep -qE '^(same|auto|[0-9a-f]{8})$' || { json_err "Некорректный id"; return 1; }
+	uci set vless.main.ai_selected="$id"; uci commit vless
+	if is_ready; then
+		if [ "$id" = "same" ]; then api PUT /proxies/ai-proxy '{"name":"proxy"}' >/dev/null
+		elif [ "$id" = "auto" ]; then api PUT /proxies/ai-proxy '{"name":"auto"}' >/dev/null
+		else api PUT /proxies/ai-proxy "{\"name\":\"s-$id\"}" >/dev/null; fi
+	fi
+	jq -n -c --arg id "$id" '{ok:true,ai_selected:$id}'
 }

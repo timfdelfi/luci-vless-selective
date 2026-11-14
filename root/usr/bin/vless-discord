@@ -339,20 +339,21 @@ verify_sha256() {
 
 # Каталоги бинарников zapret для архитектуры роутера (в разных релизах имена разные)
 arch_dirs() {
-	local a
-	a="$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_ARCH")"
+	local a="$1"
+	[ -n "$a" ] || a="${DISTRIB_ARCH:-}"
+	[ -n "$a" ] || a="$(. /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_ARCH")"
 	[ -n "$a" ] || a="$(uname -m)"
 	case "$a" in
-		aarch64*|arm64*)    echo "linux-arm64 aarch64" ;;
-		arm*)               echo "linux-arm" ;;
-		x86_64*)            echo "linux-x86_64" ;;
-		i386*|i686*|x86*)   echo "linux-x86" ;;
-		mips64el*)          echo "linux-mips64el" ;;
-		mips64*)            echo "linux-mips64" ;;
-		mipsel*)            echo "linux-mipsel mips32r1-lsb linux-mips32r1-lsb" ;;
-		mips*)              echo "linux-mips mips32r1-msb linux-mips32r1-msb" ;;
-		riscv64*)           echo "linux-riscv64" ;;
-		powerpc*|ppc*)      echo "linux-ppc" ;;
+		aarch64*|arm64*)    echo "aarch64 arm64 linux-arm64" ;;
+		armv7*|armv8*|arm*) echo "arm armhf armv7 linux-arm" ;;
+		x86_64*|amd64*)     echo "x86_64 linux-x86_64" ;;
+		i386*|i686*|x86*)   echo "x86 i386 linux-x86" ;;
+		mips64el*)          echo "mips64el linux-mips64el" ;;
+		mips64*)            echo "mips64 linux-mips64" ;;
+		mipsel*)            echo "mipsel mips32r1-lsb linux-mipsel linux-mips32r1-lsb" ;;
+		mips*)              echo "mips mips32r1-msb linux-mips linux-mips32r1-msb" ;;
+		riscv64*)           echo "riscv64 linux-riscv64" ;;
+		powerpc*|ppc*)      echo "ppc powerpc linux-ppc" ;;
 		*)                  echo "" ;;
 	esac
 }
@@ -651,9 +652,15 @@ cmd_auto() {
 			cmd_status; return ;;
 	esac
 
-	if ! err="$(ensure_installed)"; then
-		fallback "не удалось подготовить zapret: $err"
+	if [ ! -x "$NFQWS" ]; then
+		fallback "zapret не установлен (нажмите «Скачать zapret» в настройках)"
 		cmd_status; return
+	fi
+	if [ ! -s "$FAKE/tls_clienthello_www_google_com.bin" ] || [ ! -s "$LIST" ]; then
+		if ! err="$(ensure_installed)"; then
+			fallback "не удалось подготовить zapret: $err"
+			cmd_status; return
+		fi
 	fi
 	if [ -n "$(foreign_nfqws)" ]; then
 		state_set conflict true
@@ -705,6 +712,11 @@ cmd_off() {
 	set_active off ""
 	state_set busy '""' fails 0
 	cmd_status
+}
+
+cmd_stop() {
+	nft_down
+	offload_restore
 }
 
 # apply — применить настройки (вызывается после сохранения в интерфейсе, в фоне)
@@ -761,6 +773,10 @@ cmd_install() {
 	state_set busy "$(jstr "загрузка стратегий Flowseal")"
 	err="$(update_assets force)" || { state_set busy '""'; build_list; json_err "nfqws установлен, но файлы Flowseal не скачались: $err"; return 1; }
 	state_set busy '""'
+	case "$(cfg discord_mode off)" in
+		auto|zapret)
+			( "$0" auto force >/dev/null 2>&1 & ) ;;
+	esac
 	jq -n -c '{ok:true}'
 }
 
@@ -883,6 +899,7 @@ case "$1" in
 	cmdline)    service_cmdline ;;
 	nft-up)     nft_up ;;
 	nft-down)   nft_down ;;
+	stop)       cmd_stop ;;
 	nft-rules)  nft_rules ;;
 	args)       strategy_args "$2" ;;
 	strategies) strategy_ids ;;

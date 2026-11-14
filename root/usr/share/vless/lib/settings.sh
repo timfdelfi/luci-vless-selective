@@ -29,6 +29,7 @@ settings_json() {
 		--arg user_agent "$(cfg user_agent "$VLESS_UA_DEFAULT")" --arg hwid "$(get_hwid)" \
 		--arg update_interval "$(cfg update_interval 24)" \
 		--arg selected "$(cfg selected auto)" \
+		--arg ai_selected "$(cfg ai_selected same)" \
 		--arg discord_mode "$(cfg discord_mode off)" --arg discord_offload "$(cfg discord_offload 1)" \
 		--arg auto_interval "$(cfg auto_interval 3m)" \
 		--arg auto_tolerance "$(cfg auto_tolerance 80)" \
@@ -39,7 +40,7 @@ settings_json() {
 		   kill_switch:($kill_switch=="1"), block_quic:($block_quic=="1"), block_ipv6:($block_ipv6=="1"), bypass_vpn:($bypass_vpn=="1"),
 		   bypass_ru:($bypass_ru=="1"), tun_stack:$tun_stack, mtu:(try ($mtu|tonumber) catch 1400), log_level:$log_level,
 		   discord_mode:$discord_mode, discord_offload:($discord_offload=="1"),
-		   user_agent:$user_agent, hwid:$hwid, update_interval:(try ($update_interval|tonumber) catch 24), selected:$selected,
+		   user_agent:$user_agent, hwid:$hwid, update_interval:(try ($update_interval|tonumber) catch 24), selected:$selected, ai_selected:$ai_selected,
 		   auto_interval:$auto_interval, auto_tolerance:(try ($auto_tolerance|tonumber) catch 80), auto_test_url:$auto_test_url,
 		   direct_domains:($dd|split(" ")|map(select(length>0))),
 		   devices:($dev|split(" ")|map(select(length>0))),
@@ -60,7 +61,7 @@ cmd_set() {
 	printf '%s\n' "$data" | jq -r '
 		def b: if . == true then "1" elif . == false then "0" else . end;
 		[ "scope","mode","dns_mode","remote_dns","direct_dns","bootstrap_dns","kill_switch","block_quic","block_ipv6","bypass_ru","bypass_vpn",
-		  "tun_stack","mtu","log_level","user_agent","update_interval","selected",
+		  "tun_stack","mtu","log_level","user_agent","update_interval","selected","ai_selected",
 		  "auto_interval","auto_tolerance","auto_test_url","discord_mode","discord_offload" ] as $keys
 		| $keys[] as $k | select(has($k)) | "\($k)\t\(.[$k] | b | tostring)"' | tr -d '\r' |
 	while IFS="$TAB" read -r k v; do
@@ -78,6 +79,7 @@ cmd_set() {
 			mtu)            { echo "$v" | grep -qE '^[0-9]{4}$' && [ "$v" -ge 1000 ] && [ "$v" -le 9000 ]; } || bad=1 ;;
 			update_interval) { echo "$v" | grep -qE '^[0-9]{1,3}$' && [ "$v" -le 720 ]; } || bad=1 ;;
 			selected)       echo "$v" | grep -qE '^(auto|[0-9a-f]{8})$' || bad=1 ;;
+			ai_selected)    echo "$v" | grep -qE '^(same|auto|[0-9a-f]{8})$' || bad=1 ;;
 			auto_interval)  echo "$v" | grep -qE '^[0-9]+(s|m|h)$' || bad=1 ;;
 			auto_tolerance) { echo "$v" | grep -qE '^[0-9]{1,4}$' && [ "$v" -le 1000 ]; } || bad=1 ;;
 			auto_test_url)  case "$v" in http://*|https://*) ;; *) bad=1 ;; esac ;;

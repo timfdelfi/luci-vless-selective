@@ -11,7 +11,7 @@ echo.
 echo  Дальше роутер дважды спросит пароль root (при вводе символы не видны - это нормально).
 echo.
 pushd "%~dp0"
-tar -czf "%TEMP%\vless-vpn.tar.gz" .
+tar -czf "%TEMP%\vless-vpn.tar.gz" --exclude=".git" --exclude="docs" --exclude="tests" --exclude="*.bat" --exclude="*.zip" --exclude="*.tar.gz" root htdocs install.sh uninstall.sh VERSION
 set "RC=%errorlevel%"
 popd
 if not "%RC%"=="0" goto fail

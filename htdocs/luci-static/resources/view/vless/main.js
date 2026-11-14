@@ -19,6 +19,7 @@ var rAdd        = H('add', ['text']);
 var rRemove     = H('remove', ['id']);
 var rRefresh    = H('refresh', ['id']);
 var rSelect     = H('select', ['id']);
+var rSelectAi   = H('select-ai', ['id']);
 var rSet        = H('set', ['settings']);
 var rCheck      = H('check');
 var rPing       = H('ping');
@@ -34,6 +35,7 @@ var rImport     = H('import', ['backup']);
 var rFetchCore  = H('fetch-core', ['force']);
 var rDiscordStatus = H('discord-status');
 var rDiscordRun    = H('discord-run', ['action']);
+var rTestRoute     = H('test-route', ['target']);
 
 /* Ретраи для сетевых запросов с экспоненциальной задержкой */
 var MAX_RETRIES = 3;
@@ -440,7 +442,7 @@ var PRESETS = [
 	['discord', 'Discord', ''],
 	['meta', 'Meta', 'Instagram, Facebook, WhatsApp, Threads'],
 	['x', 'X (Twitter)', ''],
-	['ai', 'ИИ-сервисы', 'ChatGPT, Claude, Gemini, Perplexity, Grok'],
+	['ai', 'ИИ и нейросети', 'Antigravity, Gemini, ChatGPT, Claude, Perplexity, Grok'],
 	['adult', '18+', 'Сайты для взрослых']
 ];
 
@@ -694,10 +696,12 @@ return view.extend({
 		this.powerEl.appendChild(this.timerEl);
 
 		this.curEl = E('div', { style: 'width:100%' });
+		this.aiEl = E('div', { style: 'width:100%' });
 		this.statsEl = E('div', { style: 'width:100%' });
 		this.errEl = E('div', { 'class': 'hv-err', style: 'display:none', role: 'alert' });
 		right.appendChild(this.powerEl);
 		right.appendChild(this.curEl);
+		right.appendChild(this.aiEl);
 		right.appendChild(this.statsEl);
 		right.appendChild(this.errEl);
 
@@ -910,6 +914,7 @@ return view.extend({
 				]));
 			}
 		}
+		this.updateAiServer();
 
 		/* статистика: каркас строится один раз, дальше обновляются только значения.
 		   Полная пересборка каждые 3 секунды теряла фокус и сбрасывала disabled
@@ -1093,6 +1098,67 @@ return view.extend({
 				setTimeout(function () { self.doCheck(); }, 1200);
 			}
 		}).catch(function () { self.toast('Не удалось выбрать сервер', true); });
+	},
+
+	doSelectAi: function (id) {
+		var self = this;
+		if (((this.S.settings || {}).ai_selected || 'same') === id) return;
+		withRetry(function () { return rSelectAi(id); }).then(function (r) {
+			if (!r || !r.ok) { self.toast((r && r.error) || 'Не удалось выбрать сервер для ИИ', true); return; }
+			if (self.S.settings) self.S.settings.ai_selected = id;
+			self.updateAiServer();
+			if (self.F && self.F.ai_selected && self.F.ai_selected.el) self.F.ai_selected.el.value = id;
+			self.toast('Сервер для нейросетей переключён');
+		}).catch(function () { self.toast('Не удалось выбрать сервер для нейросетей', true); });
+	},
+
+	updateAiServer: function () {
+		var self = this, S = this.S, servers = this.servers();
+		if (!this.aiEl) return;
+		if (!servers.length) { this.aiEl.innerHTML = ''; return; }
+		var aiSel = (S.settings && S.settings.ai_selected) || 'same';
+		var curAi = (aiSel !== 'same' && aiSel !== 'auto') ? this.serverById(aiSel) : null;
+		var label = 'Тот же, что основной';
+		var flagCode = '';
+		if (aiSel === 'auto') {
+			label = 'Авто (быстрейший)';
+		} else if (curAi) {
+			var f = flagInfo(curAi.name);
+			label = f.name;
+			flagCode = f.code;
+		}
+
+		var opts = [
+			E('option', { value: 'same' }, 'Тот же, что основной'),
+			E('option', { value: 'auto' }, 'Авто (быстрейший)')
+		];
+		servers.forEach(function (s) {
+			if (!s.supported) return;
+			var f = flagInfo(s.name);
+			opts.push(E('option', { value: s.id }, (f.code ? f.code.toUpperCase() + ' ' : '') + f.name));
+		});
+
+		var sel = E('select', {
+			'class': 'hv-sel sm',
+			style: 'max-width:170px;font-size:12px;padding:3px 6px;margin:0',
+			change: function () { self.doSelectAi(this.value); }
+		}, opts);
+		sel.value = aiSel;
+
+		this.aiEl.innerHTML = '';
+		this.aiEl.appendChild(E('div', {
+			'class': 'hv-cur',
+			style: 'margin-top:6px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px'
+		}, [
+			E('div', { style: 'display:flex;align-items:center;gap:8px;min-width:0;flex:1' }, [
+				flagCode ? flagEl(flagCode) : flagEl('', true),
+				E('div', { 'class': 'hv-nm', style: 'min-width:0' }, [
+					E('b', { style: 'font-size:12.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, 'ИИ / Нейросети: ' + label),
+					E('span', { style: 'font-size:11px;color:var(--tx2);display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, 'Antigravity, ChatGPT, Claude, Gemini')
+				])
+			]),
+			sel
+		]));
 	},
 
 	doRemove: function (id, name, what) {
@@ -1450,10 +1516,19 @@ return view.extend({
 		});
 
 		/* — DNS — */
-		var dnsPresets = ['1.1.1.1', '8.8.8.8', '9.9.9.9'], dnsCur = s.remote_dns || '1.1.1.1';
-		var dnsSel = select('dns_sel', [['1.1.1.1', 'Cloudflare (1.1.1.1)'], ['8.8.8.8', 'Google (8.8.8.8)'], ['9.9.9.9', 'Quad9 (9.9.9.9)'], ['custom', 'Свой адрес…']],
-			dnsPresets.indexOf(dnsCur) >= 0 ? dnsCur : 'custom');
-		var dnsCustom = input('dns_custom', dnsPresets.indexOf(dnsCur) >= 0 ? '' : dnsCur, '1.2.3.4');
+		var dnsPresetItems = [
+			['1.1.1.1', 'Cloudflare (1.1.1.1)'],
+			['8.8.8.8', 'Google (8.8.8.8)'],
+			['9.9.9.9', 'Quad9 (9.9.9.9)'],
+			['tls://1.1.1.1', 'Cloudflare DoT (tls://1.1.1.1)'],
+			['https://cloudflare-dns.com/dns-query', 'Cloudflare DoH (https://...)'],
+			['custom', 'Свой адрес…']
+		];
+		var dnsPresetKeys = ['1.1.1.1', '8.8.8.8', '9.9.9.9', 'tls://1.1.1.1', 'https://cloudflare-dns.com/dns-query'];
+		var dnsCur = s.remote_dns || '1.1.1.1';
+		var dnsSel = select('dns_sel', dnsPresetItems,
+			dnsPresetKeys.indexOf(dnsCur) >= 0 ? dnsCur : 'custom');
+		var dnsCustom = input('dns_custom', dnsPresetKeys.indexOf(dnsCur) >= 0 ? '' : dnsCur, '1.1.1.1, tls://... или https://...');
 		dnsCustom.style.marginTop = '8px';
 		var syncDns = function () { dnsCustom.style.display = dnsSel.value === 'custom' ? '' : 'none'; };
 		dnsSel.addEventListener('change', syncDns); syncDns();
@@ -1481,6 +1556,139 @@ return view.extend({
 				click: function () { copyText(s.hwid || '').then(function () { self.toast('HWID скопирован'); }, function () { self.toast('Не удалось скопировать — выделите вручную', true); }); } }, [ic('copy')])
 		]);
 
+		var aiItems = [
+			['same', 'Тот же, что основной'],
+			['auto', 'Авто (быстрейший)']
+		];
+		(this.servers() || []).forEach(function (srv) {
+			if (!srv.supported) return;
+			var f = flagInfo(srv.name);
+			aiItems.push([srv.id, (f.code ? f.code.toUpperCase() + ' ' : '') + f.name]);
+		});
+
+		/* — Плашка: Проверка маршрута и метода обхода — */
+		var routeTargetInput = input('test_route_target', '', 'api.openai.com, discord.com, ya.ru...');
+		routeTargetInput.style.flex = '1';
+		routeTargetInput.spellcheck = false;
+
+		var routeTestResult = E('div', { 'class': 'hv-route-res', style: 'display:none;margin-top:12px;padding:12px;border-radius:var(--r);background:var(--card2);border:1px solid var(--line);' });
+
+		var routeTestIcon = ic('search');
+		var routeTestLabel = E('span', {}, _('Проверить'));
+		var routeTestBtn = E('button', {
+			type: 'button', 'class': 'hv-btn sec',
+			style: 'flex:none;white-space:nowrap;',
+			click: function () {
+				var val = routeTargetInput.value.trim();
+				if (!val) { self.toast('Введите домен или IP-адрес для проверки', true); return; }
+				routeTestBtn.disabled = true;
+				routeTestBtn.classList.add('spin');
+				routeTestLabel.textContent = _('Проверка…');
+				routeTestResult.style.display = 'none';
+
+				var done = function () {
+					routeTestBtn.disabled = false;
+					routeTestBtn.classList.remove('spin');
+					routeTestLabel.textContent = _('Проверить');
+				};
+
+				rTestRoute(val).then(function (res) {
+					done();
+					if (!res || !res.ok) {
+						self.toast((res && res.error) || 'Ошибка проверки маршрута', true);
+						return;
+					}
+					routeTestResult.innerHTML = '';
+					routeTestResult.style.display = '';
+
+					var badgeColor = 'var(--tx2)';
+					var badgeBg = 'var(--card)';
+					if (res.route === 'ai-proxy') {
+						badgeColor = '#8a5cf6';
+						badgeBg = 'rgba(139,92,246,0.15)';
+					} else if (res.route === 'proxy') {
+						badgeColor = 'var(--ok)';
+						badgeBg = 'var(--oks)';
+					} else if (res.route === 'zapret') {
+						badgeColor = 'var(--ac)';
+						badgeBg = 'var(--acs)';
+					} else {
+						badgeColor = 'var(--warn)';
+						badgeBg = 'var(--warns)';
+					}
+
+					var header = E('div', { style: 'display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;' }, [
+						E('div', { style: 'font-weight:700;font-size:14px;color:var(--tx);display:flex;align-items:center;gap:6px;' }, [
+							E('span', { style: 'font-family:ui-monospace,Menlo,monospace;' }, res.target),
+							E('span', { style: 'font-size:11px;font-weight:600;padding:2px 8px;border-radius:12px;color:' + badgeColor + ';background:' + badgeBg + ';' }, res.label || res.route)
+						]),
+						(res.ping != null ? E('div', { 'class': 'hv-ms ' + msClass(res.ping), title: 'Задержка' }, res.ping + ' мс') : E('div', { 'class': 'hv-ms none' }, '—'))
+					]);
+
+					var infoList = E('div', { style: 'display:grid;grid-gap:6px;font-size:12.5px;' });
+
+					var addRow = function (label, valHtml) {
+						var r = E('div', { style: 'display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid var(--line);padding-bottom:4px;' }, [
+							E('span', { style: 'color:var(--tx2);' }, label),
+							E('span', { style: 'font-weight:550;color:var(--tx);text-align:right;' }, valHtml)
+						]);
+						infoList.appendChild(r);
+					};
+
+					addRow('Метод обхода:', res.label || res.route);
+					addRow('Сработавшее правило:', res.rule || '—');
+
+					if (res.server) {
+						var srvName = (res.server.name || res.server.host);
+						if (res.is_auto) srvName += ' (Автовыбор)';
+						addRow('Используемый сервер:', srvName);
+						addRow('Параметры подключения:', res.server.host + ':' + res.server.port + ' · ' + (res.server.proto || 'vless').toUpperCase());
+					} else {
+						addRow('Используемый сервер:', 'Без VPN (локальный провайдер)');
+					}
+
+					addRow('Статус VPN на роутере:', res.vpn_running ? 'Подключён' : 'Выключен (показан расчётный маршрут)');
+
+					routeTestResult.appendChild(header);
+					routeTestResult.appendChild(infoList);
+				}).catch(function (err) {
+					done();
+					self.toast('Ошибка запроса: ' + (err.message || err), true);
+				});
+			}
+		}, [routeTestIcon, routeTestLabel]);
+
+		routeTargetInput.addEventListener('keydown', function (ev) {
+			if (ev.key === 'Enter') { ev.preventDefault(); routeTestBtn.click(); }
+		});
+
+		var quickChips = E('div', { 'class': 'hv-chips', style: 'margin-top:8px;' });
+		var quickSamples = [
+			['ChatGPT', 'api.openai.com'],
+			['Claude', 'claude.ai'],
+			['Gemini', 'generativelanguage.googleapis.com'],
+			['Discord', 'discord.com'],
+			['YouTube', 'googlevideo.com'],
+			['Яндекс (РФ)', 'yandex.ru']
+		];
+		quickSamples.forEach(function (pair) {
+			var chip = E('button', {
+				type: 'button', 'class': 'hv-chip',
+				style: 'cursor:pointer;font-size:11.5px;padding:3px 8px;',
+				click: function () {
+					routeTargetInput.value = pair[1];
+					routeTestBtn.click();
+				}
+			}, [E('span', {}, pair[0])]);
+			quickChips.appendChild(chip);
+		});
+
+		var routeInspectorSection = section('search', 'Проверка маршрута и метода обхода', 'Проверьте, пойдёт ли сервис через выделенный сервер ИИ, основной VPN или напрямую, и замерьте пинг.', [
+			E('div', { style: 'display:flex;gap:8px;align-items:center;' }, [routeTargetInput, routeTestBtn]),
+			quickChips,
+			routeTestResult
+		]);
+
 		var left = E('div', { 'class': 'hv-colm' }, [
 			section('power', 'Основное', 'Всё уже настроено — менять ничего не обязательно.', [
 				toggleRow('autostart', 'Запускать при включении роутера', 'VPN поднимется сам после перезагрузки', s.autostart, true),
@@ -1489,9 +1697,11 @@ return view.extend({
 			]),
 			section('route', 'Что пускать через VPN', null, [
 				F.route.el, routeHint, presetBox,
+				optRow('Сервер для нейросетей и ИИ', 'Antigravity, ChatGPT, Claude, Gemini пойдут через этот сервер', select('ai_selected', aiItems, s.ai_selected || 'same')),
 				E('div', { 'class': 'hv-label' }, ['Свои исключения', E('span', {}, 'Домены или подсети, которые всегда идут напрямую')]),
 				area('direct_domains', s.direct_domains, 'example.com\nbank.ru\n203.0.113.0/24')
 			]),
+			routeInspectorSection,
 			section('zap', 'Discord', 'Отдельный обход только для Discord: через zapret — быстрее и без нагрузки на VPN, а если не сработает — через VPN.', [
 				optRow('Как пускать Discord', 'Голос и демонстрация экрана тоже идут этим путём', select('discord_mode', [['off', 'Не трогать'], ['auto', 'zapret, при сбое — VPN'], ['zapret', 'Только zapret'], ['vpn', 'Только VPN']], s.discord_mode || 'off'), true, true),
 				toggleRow('discord_offload', 'Отключить flow offloading', 'zapret не работает с ним: роутер перестаёт ускорять соединения в обход процессора. Прежнее значение вернётся при выключении обхода', s.discord_offload !== false),
@@ -1600,8 +1810,11 @@ return view.extend({
 
 		var custom = F.dns_sel.get() === 'custom';
 		var dns = custom ? F.dns_custom.get() : F.dns_sel.get();
-		if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(dns) || dns.split('.').some(function (n) { return +n > 255; }))
-			return fail(custom ? F.dns_custom : F.dns_sel, 'DNS-сервер должен быть IP-адресом, например 1.1.1.1');
+		var isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(dns) && !dns.split('.').some(function (n) { return +n > 255; });
+		var isProto = /^(tls:\/\/|https:\/\/|udp:\/\/)/.test(dns);
+		var isIpv6 = dns && dns.indexOf(':') >= 0 && /^[a-fA-F0-9:]+$/.test(dns);
+		if (!dns || (!isIp && !isProto && !isIpv6))
+			return fail(custom ? F.dns_custom : F.dns_sel, 'Удалённый DNS: укажите IP-адрес, tls://... или https://...');
 		var customDir = F.direct_dns_sel.get() === 'custom';
 		var dirDns = customDir ? F.direct_dns_custom.get() : F.direct_dns_sel.get();
 		if (!dirDns || !/^(tls:\/\/|https:\/\/|udp:\/\/|\d{1,3}(\.\d{1,3}){3})/.test(dirDns))
@@ -1647,7 +1860,8 @@ return view.extend({
 			auto_tolerance: tolerance,
 			auto_test_url: testUrl,
 			discord_mode: F.discord_mode.get(),
-			discord_offload: F.discord_offload.get()
+			discord_offload: F.discord_offload.get(),
+			ai_selected: F.ai_selected ? F.ai_selected.get() : ((this.S.settings || {}).ai_selected || 'same')
 		};
 		var prevDiscord = (this.S.settings || {}).discord_mode || 'off';
 		btn.disabled = true;
@@ -1657,6 +1871,7 @@ return view.extend({
 			Object.assign(self.S.settings, settings);
 			self._dirty = false;
 			self.updateSaveBar();
+			self.updateAiServer();
 			if (r.ignored && r.ignored.length) {
 				self.toast('Сохранено, но часть значений отклонена: ' + r.ignored.slice(0, 4).join(', '), 'warn');
 			} else self.toast(running ? 'Сохранено — перезапускаю VPN…' : 'Сохранено');
@@ -1685,8 +1900,8 @@ return view.extend({
 		};
 		var path = { zapret: ['через zapret', 'ok'], vpn: ['через VPN', 'warn'], off: ['не обрабатывается', ''], error: ['не работает', 'bad'] }[d.active] || [d.active, ''];
 		box.appendChild(row('Discord сейчас', path[0], path[1]));
+		box.appendChild(row('zapret', d.installed ? (d.running ? 'работает' : 'остановлен') : 'не скачан (нажмите «Скачать zapret»)', d.installed && d.running ? 'ok' : (d.installed ? 'warn' : '')));
 		if (d.mode === 'auto' || d.mode === 'zapret') {
-			box.appendChild(row('zapret', d.installed ? (d.running ? 'работает' : 'остановлен') : 'не установлен', d.installed && d.running ? 'ok' : (d.installed ? 'warn' : '')));
 			if (d.strategy_name && d.active === 'zapret') box.appendChild(row('Стратегия', d.strategy + ' — ' + d.strategy_name));
 			if (d.strategies) box.appendChild(row('Стратегий в наборе', String(d.strategies)));
 			box.appendChild(row('Последняя проверка', ago(d.last_check)));
@@ -1696,6 +1911,8 @@ return view.extend({
 				box.appendChild(row('Перебрано стратегий', tried.length + (tried.some(function (r) { return r.ok; }) ? ' (подошла последняя)' : ' (ни одна не подошла)')));
 			}
 			if (d.offload_disabled) box.appendChild(row('Flow offloading', 'отключён скриптом', 'warn'));
+		} else if (d.zapret || d.flowseal) {
+			box.appendChild(row('Версии', [d.zapret ? 'nfqws ' + d.zapret : '', d.flowseal ? 'Flowseal ' + d.flowseal : ''].filter(Boolean).join(' · ')));
 		}
 		if (d.mode === 'auto' && d.vpn_servers === 0)
 			box.appendChild(E('div', { 'class': 'hv-hint' }, 'Запасной путь через VPN не заработает: добавьте сервер на вкладке «Подключение».'));
@@ -1709,9 +1926,12 @@ return view.extend({
 			acts.appendChild(b);
 		};
 		if (d.mode === 'auto' || d.mode === 'zapret') {
-			btn('Проверить сейчас', 'auto');
-			if (!d.installed) btn('Установить zapret', 'install', true);
-			else btn('Обновить стратегии', 'update', true);
+			if (d.installed) btn('Проверить сейчас', 'auto');
+			if (!d.installed) btn('Скачать zapret', 'install', false);
+			else btn('Обновить zapret', 'update', true);
+		} else {
+			if (!d.installed) btn('Скачать zapret', 'install', true);
+			else btn('Обновить zapret', 'update', true);
 		}
 		if (acts.childNodes.length) box.appendChild(acts);
 		if (this._dirty) box.appendChild(E('div', { 'class': 'hv-hint' }, 'Есть несохранённые изменения — кнопки действуют по сохранённым настройкам.'));

@@ -59,6 +59,7 @@ case "$1" in
 	# обязан остаться след: иначе битая подписка годами выглядит как «просто не обновилось».
 	update-all) locked cmd_update_all ;;
 	select)     locked cmd_select "$2" ;;
+	select-ai)  locked cmd_select_ai "$2" ;;
 	set)        locked cmd_set ;;
 	clear)      locked cmd_clear ;;
 	clearlog)   cmd_clearlog ;;
@@ -86,7 +87,8 @@ case "$1" in
 	export)     cmd_export ;;
 	import)     locked cmd_import ;;
 	selftest)   cmd_selftest ;;
+	test-route) cmd_test_route "$2" ;;
 	*)
-		echo "Использование: vless {state|status|connect|disconnect|add <текст>|remove <id>|refresh [id]|select <id|auto>|set|check|ping|logs|clearlog|clear|export|import|fetch-core|selftest}" >&2
+		echo "Использование: vless {state|status|connect|disconnect|add <текст>|remove <id>|refresh [id]|select <id|auto>|select-ai <same|auto|id>|set|check|ping|test-route <цель>|logs|clearlog|clear|export|import|fetch-core|selftest}" >&2
 		exit 1 ;;
 esac

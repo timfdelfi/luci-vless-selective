@@ -34,19 +34,24 @@ selective_lists() {
 
 # selective_nft_conf — правила nftables для режима «выбранные»
 selective_nft_conf() {
-	local csv="" d rule
+	local csv="" d rule set_decl=""
 	for d in $(uci -q get vless.main.devices 2>/dev/null); do
 		valid_cidr "$d" && csv="${csv:+$csv, }$d"
 	done
-		case "$(eff mode)" in
-			include)
-				if [ -n "$csv" ]; then rule="ip saddr { $csv } ip daddr @$SEL_SET meta mark set $SEL_MARK"; else rule=""; fi ;;
-			exclude)
-				if [ -n "$csv" ]; then rule="ip saddr != { $csv } ip daddr @$SEL_SET meta mark set $SEL_MARK"
-				else rule="ip daddr @$SEL_SET meta mark set $SEL_MARK"; fi ;;
-			*)  rule="ip daddr @$SEL_SET meta mark set $SEL_MARK" ;;
-		esac
+	case "$(eff mode)" in
+		include)
+			if [ -n "$csv" ]; then rule="ip saddr { $csv } ip daddr @$SEL_SET meta mark set $SEL_MARK"; else rule=""; fi ;;
+		exclude)
+			if [ -n "$csv" ]; then
+				set_decl="  set excluded_devs { type ipv4_addr; flags interval; elements = { $csv }; }"
+				rule="ip saddr != @excluded_devs ip daddr @$SEL_SET meta mark set $SEL_MARK"
+			else
+				rule="ip daddr @$SEL_SET meta mark set $SEL_MARK"
+			fi ;;
+		*)  rule="ip daddr @$SEL_SET meta mark set $SEL_MARK" ;;
+	esac
 	echo "table inet vless {"
+	[ -n "$set_decl" ] && echo "$set_decl"
 	# Набор живёт до перезапуска службы: dnsmasq добавляет элементы без таймаута,
 	# поэтому старые адреса сами не исчезают — зато переподключение всегда чистит набор.
 	echo "  set $SEL_SET { type ipv4_addr; flags interval, timeout; auto-merge; }"

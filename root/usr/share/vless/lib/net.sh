@@ -9,24 +9,28 @@ net_up_running() {
 	[ -n "$p" ] && kill -0 "$p" 2>/dev/null
 }
 
-RULE_PREFS="$RUN/rule.prefs"
+RULE_PREFS_V4="$RUN/rule.prefs"
+RULE_PREFS_V6="$RUN/rule6.prefs"
 
 # note_pref — запомнить pref только что добавленного правила.
 # Удалять будем ровно свои правила: срез «весь диапазон 9000–9199» сносил чужие
 # правила других пакетов (mwan3, второй VPN и т.п.).
-note_pref() { printf '%s\n' "$1" >> "$RULE_PREFS"; }
+note_pref()    { printf '%s\n' "$1" >> "$RULE_PREFS_V4"; }
+note_pref_v6() { printf '%s\n' "$1" >> "$RULE_PREFS_V6"; }
 
 del_rules() { # del_rules [-6]
 	# Свои правила: записанные pref + всё, что однозначно наше (наша таблица 100,
 	# наш интерфейс vless0, наше unreachable-правило для IPv6).
+	local f="$RULE_PREFS_V4"
+	[ "$1" = "-6" ] && f="$RULE_PREFS_V6"
+	[ -f "$f" ] || : > "$f"
 	local p
-	[ -f "$RULE_PREFS" ] || : > "$RULE_PREFS"
-	for p in $(cat "$RULE_PREFS"; ip $1 rule show 2>/dev/null | awk -F: -v tbl "$TABLE" -v tun "$TUN" '
-		$1+0>=9000 && $1+0<9200 && (index($0, "lookup " tbl) || index($0, tun) || (index($0, "unreachable") && index($0, "iif")))
-		{print $1+0}' | sort -un); do
+	for p in $( (cat "$f" 2>/dev/null; ip $1 rule show 2>/dev/null | awk -F: -v tbl "$TABLE" -v tun "$TUN" '
+		$1+0>=9000 && $1+0<9200 && (index($0, "lookup " tbl) || index($0, tun) || (index($0, "unreachable") && index($0, "iif")) || ($1+0==9090 && index($0, "lookup main")))
+		{print $1+0}') | sort -un); do
 		while ip $1 rule del pref "$p" 2>/dev/null; do :; done
 	done
-	: > "$RULE_PREFS"
+	: > "$f"
 }
 
 dnsmasq_dir() {
@@ -154,9 +158,9 @@ net_up() {
 		local v6ok=1
 		for dev in $devs; do
 			for net in fe80::/10 fc00::/7 ff00::/8; do
-				ip -6 rule add iif "$dev" to "$net" lookup main pref 9090 2>/dev/null && note_pref 9090
+				ip -6 rule add iif "$dev" to "$net" lookup main pref 9090 2>/dev/null && note_pref_v6 9090
 			done
-			if ip -6 rule add iif "$dev" unreachable pref 9100 2>/dev/null; then note_pref 9100; else v6ok=0; fi
+			if ip -6 rule add iif "$dev" unreachable pref 9100 2>/dev/null; then note_pref_v6 9100; else v6ok=0; fi
 		done
 		[ "$v6ok" = 1 ] || logger -t vless "не удалось заблокировать IPv6 (нужен пакет ip-full): трафик IPv6 может идти мимо VPN" 2>/dev/null
 	fi

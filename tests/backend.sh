@@ -83,6 +83,12 @@ r="$($H select "$id")"
 t "select: сервер выбран" "$r" ".ok==true and .selected==\"$id\""
 r="$($H select 'x; rm -rf /')"
 t "select: инъекция отклонена" "$r" '.ok==false'
+r="$($H select-ai "$id")"
+t "select-ai: сервер выбран" "$r" ".ok==true and .ai_selected==\"$id\""
+r="$($H select-ai same)"
+t "select-ai: сброс на same" "$r" '.ok==true and .ai_selected=="same"'
+r="$($H select-ai 'bad; rm -rf /')"
+t "select-ai: инъекция отклонена" "$r" '.ok==false'
 r="$($H remove "$id")"
 t "remove: сервер удалён" "$r" '.ok==true'
 r="$($H state)"
@@ -153,6 +159,19 @@ printf '%s\n' "$r" | cut -f2 | jq -e '.outbound.server=="b64.example.com" and .o
 printf '%s' "$XJ" > "$W/sub.json"
 printf '%s\n' "$(body_to_tsv "$W/sub.json" 2>/dev/null)" | cut -f2 | jq -e '.outbound.type=="vless"' >/dev/null 2>&1 \
 	&& ok "обычный Xray-JSON по-прежнему распознаётся" || bad "обычный Xray-JSON"
+
+echo "== подписка Hysteria/Hysteria2 в JSON (Happ/Remnawave)"
+HJ='{"outbounds":[{"tag":"Великобритания [2]","protocol":"hysteria","settings":{"version":2,"servers":[{"address":"gb.example.com","port":443}],"auth":"hy-secret-pass"},"streamSettings":{"network":"udp","security":"tls","tlsSettings":{"serverName":"gb.example.com","alpn":["h3"]}}}]}'
+printf '%s' "$HJ" > "$W/hysteria.json"
+r_hy="$(body_to_tsv "$W/hysteria.json" 2>/dev/null)"
+printf '%s\n' "$r_hy" | cut -f2 | jq -e '.name=="Великобритания [2]" and .proto=="hysteria2" and .outbound.type=="hysteria2" and .outbound.password=="hy-secret-pass" and .outbound.server=="gb.example.com"' >/dev/null 2>&1 \
+	&& ok "Hysteria Happ/Remnawave JSON распознан с правильным именем и паролем" || bad "Hysteria JSON: $r_hy"
+
+echo "== несколько outbounds в одной JSON-подписке"
+MULTI_JSON='{"outbounds":[{"tag":"Node 1","protocol":"vless","settings":{"vnext":[{"address":"n1.example.com","port":443,"users":[{"id":"11111111-1111-1111-1111-111111111111"}]}]}},{"tag":"Node 2","protocol":"hysteria2","settings":{"servers":[{"address":"n2.example.com","port":443}],"password":"p2"}}]}'
+printf '%s' "$MULTI_JSON" > "$W/multi.json"
+r_multi="$(body_to_tsv "$W/multi.json" 2>/dev/null)"
+[ "$(printf '%s\n' "$r_multi" | wc -l)" -eq 2 ] && ok "все outbounds из JSON-подписки импортированы" || bad "импортировано outbounds: $(printf '%s\n' "$r_multi" | wc -l)"
 
 echo "== замер пинга при подключённом VPN"
 # В Clash API sing-box 1.12+ нет маршрута /group/... — прежний код стучался туда
@@ -264,8 +283,33 @@ if command -v nft >/dev/null 2>&1 && printf '%s\n' "$N" | nft -c -f - >/dev/null
 else echo "  --   nft -c недоступен здесь, проверка синтаксиса пропущена"; fi
 printf '%s' '{"mode":"include","devices":["192.168.1.50"]}' | $H set >/dev/null
 $H selective-nft | grep -q 'ip saddr { 192.168.1.50 }' && ok "nft: режим «только выбранные устройства» учтён" || bad "nft: режим устройств"
+printf '%s' '{"mode":"exclude","devices":["192.168.1.50","192.168.1.60"]}' | $H set >/dev/null
+$H selective-nft | grep -q 'set excluded_devs' && $H selective-nft | grep -q 'ip saddr != @excluded_devs' \
+	&& ok "nft: режим «все, кроме выбранных» использует валидный named set" || bad "nft: некорректный синтаксис exclude"
 printf '%s' '{"scope":"all","mode":"all","devices":[]}' | $H set >/dev/null
 $H state | jq -e '.settings.bypass_ru==true or .settings.bypass_ru==false' >/dev/null && ok "состояние: поле bypass_ru есть" || bad "состояние: bypass_ru"
+
+echo "== проверка маршрута (test-route)"
+$H add "$(cat tests/links.txt)" >/dev/null
+r="$($H test-route '')"
+t "test-route: пустой ввод отклонён" "$r" '.ok==false'
+r="$($H test-route '192.168.1.1')"
+t "test-route: локальный IP -> direct" "$r" '.ok==true and .route=="direct"'
+printf '%s' '{"scope":"all","bypass_ru":true,"ai_selected":"same"}' | $H set >/dev/null
+r="$($H test-route 'https://yandex.ru/search')"
+t "test-route: .ru сервис -> direct" "$r" '.ok==true and .route=="direct"'
+r="$($H test-route 'api.openai.com')"
+t "test-route: ИИ при ai_selected=same -> proxy" "$r" '.ok==true and .route=="proxy" and .is_ai==true'
+first_id="$($H state | jq -r '.servers[0].id // empty')"
+if [ -n "$first_id" ]; then
+	printf '%s' "{\"ai_selected\":\"$first_id\"}" | $H set >/dev/null
+	r="$($H test-route 'api.openai.com')"
+	t "test-route: ИИ при ai_selected=id -> ai-proxy" "$r" ".ok==true and .route==\"ai-proxy\" and .server.id==\"$first_id\""
+fi
+r="$(printf '%s' '{"target":"claude.ai"}' | VLESS_BIN="$W/bin/vless" $RP call test-route)"
+t "rpcd call test-route: проксируется" "$r" '.ok==true and .route=="ai-proxy" and .target=="claude.ai"'
+r="$($H test-route 'CLAUDE.AI')"
+t "test-route: регистр приводится к нижнему" "$r" '.ok==true and .route=="ai-proxy" and .target=="claude.ai"'
 
 rm -rf "$W"
 [ $fail -eq 0 ] && echo "ТЕСТЫ БЭКЕНДА ПРОЙДЕНЫ" || echo "ЕСТЬ ОШИБКИ В БЭКЕНДЕ"

@@ -147,6 +147,24 @@ setu discord_mode off
 r="$($D auto force)"
 t "режим «выключено»" "$r" '.active=="off"'
 
+echo "== работа без установленного zapret"
+rm -f "$W/dd/bin/nfqws"
+setu discord_mode auto
+r="$($D auto force)"
+t "без nfqws: автоматический переход на VPN без скачивания" "$r" '.active=="vpn" and (.reason|contains("Скачать zapret"))'
+setu discord_mode zapret
+r="$($D auto force)"
+t "без nfqws в zapret-only: статус error без скачивания" "$r" '.active=="error" and (.reason|contains("Скачать zapret"))'
+
+echo "== arch_dirs: совпадение с каталогами архива bol-van/zapret"
+eval "$(sed -n '/^arch_dirs() {/,/^}/p' root/usr/bin/vless-discord)"
+dirs="$(arch_dirs x86_64)"
+case "$dirs" in *x86_64*) ok "arch_dirs: x86_64 совпадает с каталогом bol-van/zapret" ;; *) bad "arch_dirs x86_64: $dirs" ;; esac
+dirs="$(arch_dirs arm_cortex-a7_neon-vfpv4)"
+case "$dirs" in *arm*) ok "arch_dirs: arm совпадает с каталогом bol-van/zapret" ;; *) bad "arch_dirs arm: $dirs" ;; esac
+dirs="$(arch_dirs aarch64_cortex-a53)"
+case "$dirs" in *aarch64*) ok "arch_dirs: aarch64 совпадает с каталогом bol-van/zapret" ;; *) bad "arch_dirs aarch64: $dirs" ;; esac
+
 echo "== cron"
 setu discord_mode auto; $D sync-cron
 grep -q '^\*/10 \* \* \* \* /usr/bin/vless-discord auto' "$VLESS_CRON" && ok "cron: проверка раз в 10 минут" || bad "cron: проверка"

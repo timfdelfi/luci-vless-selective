@@ -12,9 +12,10 @@ cmd_status() {
 		now_act="$(api GET /proxies/proxy | jq -r '.now // empty' 2>/dev/null)"
 		[ "$now_act" = "auto" ] && now_act="$(api GET /proxies/auto | jq -r '.now // empty' 2>/dev/null)"
 		active="${now_act#s-}"
-		api GET /connections > "$RUN/conn.json.tmp" 2>/dev/null && mv "$RUN/conn.json.tmp" "$RUN/conn.json"
-		up="$(jq -r '.uploadTotal // 0' "$RUN/conn.json" 2>/dev/null)"
-		down="$(jq -r '.downloadTotal // 0' "$RUN/conn.json" 2>/dev/null)"
+		local conn_head
+		conn_head="$(api GET /connections | head -c 2048 2>/dev/null)"
+		up="$(printf '%s' "$conn_head" | sed -n 's/.*"uploadTotal"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+		down="$(printf '%s' "$conn_head" | sed -n 's/.*"downloadTotal"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
 		since="$(cat "$RUN/up_since" 2>/dev/null)"
 		if [ -s "$RUN/traffic.prev" ]; then
 			local prev_t prev_u prev_d dt

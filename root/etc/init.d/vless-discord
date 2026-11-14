@@ -27,9 +27,9 @@ start_service() {
 }
 
 stop_service() {
-	"$D" nft-down
+	"$D" stop
 }
 
 service_stopped() {
-	"$D" nft-down
+	"$D" stop
 }

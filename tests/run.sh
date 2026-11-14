@@ -68,6 +68,12 @@ cj "режим «всё, кроме РФ»: .ru напрямую"        '.route
 cfg="$(build "{$B,\"scope\":\"all\",\"bypass_ru\":true,\"direct_domains\":[\"example.org\"]}")"
 cj "QUIC режется после правил «напрямую»"       '([.route.rules[]|.action=="reject"]|index(true)) > ([.route.rules[]|.outbound=="direct" and has("domain_suffix")]|index(true))'
 cj "reject-правило QUIC присутствует"           '[.route.rules[]|select(.action=="reject" and .port==443)]|length==1'
+cfg="$(build "{$B,\"remote_dns\":\"https://cloudflare-dns.com/dns-query\",\"scope\":\"all\"}")"
+cj "DoH с доменным именем: domain_resolver=dns-bootstrap" '.dns.servers[] | select(.tag=="dns-remote") | .domain_resolver=="dns-bootstrap"'
+cfg="$(build "{$B,\"scope\":\"all\",\"ai_selected\":\"auto\"}")"
+cj "ai-proxy selector присутствует" '.outbounds | any(.tag=="ai-proxy" and .type=="selector")'
+cj "Antigravity/Gemini домены идут через ai-proxy" '.route.rules | any(.outbound=="ai-proxy" and (.domain_suffix|index("generativelanguage.googleapis.com")))'
+cj "клиентские VPN (WireGuard/OpenVPN) идут напрямую" '.route.rules | any(.outbound=="direct" and .network=="udp" and (.port|index(51820)) and (.port|index(1194)))'
 
 echo "== функции бэкенда"
 eval "$(sed -n '/^valid_ip()/,/^}/p;/^valid_cidr()/,/^}/p;/^valid_ipv6()/,/^}/p;/^valid_domain()/,/^}/p;/^valid_route_target()/,/^}/p;/^cron_spec()/,/^}/p' $VSRC)"

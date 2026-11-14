@@ -22,8 +22,8 @@ def presets: {
   discord: {
     domains: ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media",
               "discordcdn.com", "discord.gift", "discord.new", "discordstatus.com"],
-    # голосовой сервер Discord (Google Cloud), наблюдался в UDP-потоке; в DNS не попадает
-    cidrs: ["35.217.0.0/16"]
+    # голосовые серверы Discord (Google Cloud + AS212356 Discord Inc / i3D.net RTC)
+    cidrs: ["35.217.0.0/16", "66.22.192.0/18"]
   },
   meta: {
     domains: ["facebook.com", "fb.com", "fb.me", "fbcdn.net", "fbsbx.com", "facebook.net", "messenger.com",
@@ -35,8 +35,16 @@ def presets: {
   },
   ai: {
     domains: ["openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com", "anthropic.com",
-              "claude.ai", "claude.com", "gemini.google.com", "perplexity.ai", "grok.com", "x.ai",
-              "copilot.microsoft.com"]
+              "claude.ai", "claude.com", "perplexity.ai", "pplx.ai", "grok.com", "x.ai",
+              "copilot.microsoft.com", "sydney.bing.com",
+              # Google AI Studio, Gemini API, DeepMind, Antigravity
+              "generativelanguage.googleapis.com", "alkalimakersuite-pa.clients6.google.com",
+              "proactivebackend-pa.googleapis.com", "aisandbox-pa.googleapis.com",
+              "gemini.google.com", "aistudio.google.com", "ai.google.dev",
+              "deepmind.google", "deepmind.com", "notebooklm.google", "notebooklm.google.com",
+              "labs.google", "labs.google.com", "bard.google.com",
+              # Другие ИИ-сервисы и API
+              "mistral.ai", "groq.com", "poe.com", "huggingface.co", "hf.co", "cohere.com", "cohere.ai"]
   },
   adult: {
     domains: ["pornhub.com", "phncdn.com", "xvideos.com", "xvideos-cdn.com", "xnxx.com", "xhamster.com",

@@ -96,7 +96,7 @@ def urlparse:
       query: ($q[1] | qparse),
       frag: (($f[1] // "") | pct) };
 
-def islink: startswith("vless://") or startswith("vmess://") or startswith("trojan://") or startswith("ss://") or startswith("hysteria2://") or startswith("hy2://");
+def islink: startswith("vless://") or startswith("vmess://") or startswith("trojan://") or startswith("ss://") or startswith("hysteria2://") or startswith("hy2://") or startswith("hysteria://");
 
 def truthy: . == "1" or . == "true" or . == true;
 def nonempty: if . == null or . == "" then null else . end;
@@ -139,14 +139,15 @@ def mk($proto; $name; $host; $port; $net; $sec; $ob):
 # ---- vless ----
 def vless($u):
   $u.query as $q
+  | ($u.port // 443) as $port
   | ($q.type // "tcp") as $net
   | ($q.security // "none") as $sec
   | transport($net; ($q.host | nonempty); ($q.path | nonempty); (($q.serviceName // $q.service_name) | nonempty); ($q.headerType | nonempty)) as $tr
   | if ($q.encryption // "none") != "none" then
-      mk("vless"; $u.frag; $u.host; $u.port; $net; $sec; { unsupported: "VLESS encryption не поддерживается" })
+      mk("vless"; $u.frag; $u.host; $port; $net; $sec; { unsupported: "VLESS encryption не поддерживается" })
     else
-      mk("vless"; $u.frag; $u.host; $u.port; $net; $sec; {
-        type: "vless", server: $u.host, server_port: $u.port, uuid: $u.user,
+      mk("vless"; $u.frag; $u.host; $port; $net; $sec; {
+        type: "vless", server: $u.host, server_port: $port, uuid: $u.user,
         flow: ($q.flow | nonempty), packet_encoding: "xudp",
         tls: tlsobj($sec; $q; $net), transport: $tr })
     end;
@@ -154,11 +155,12 @@ def vless($u):
 # ---- trojan ----
 def trojan($u):
   $u.query as $q
+  | ($u.port // 443) as $port
   | ($q.type // "tcp") as $net
   | ($q.security // "tls") as $sec
   | transport($net; ($q.host | nonempty); ($q.path | nonempty); (($q.serviceName // $q.service_name) | nonempty); ($q.headerType | nonempty)) as $tr
-  | mk("trojan"; $u.frag; $u.host; $u.port; $net; $sec; {
-      type: "trojan", server: $u.host, server_port: $u.port, password: $u.user,
+  | mk("trojan"; $u.frag; $u.host; $port; $net; $sec; {
+      type: "trojan", server: $u.host, server_port: $port, password: $u.user,
       tls: tlsobj($sec; $q; $net), transport: $tr });
 
 # ---- vmess ----
@@ -196,7 +198,8 @@ def ss($line):
 def hy2($u):
   $u.query as $q
   | mk("hysteria2"; $u.frag; $u.host; ($u.port // 443); "udp"; "tls"; {
-      type: "hysteria2", server: $u.host, server_port: ($u.port // 443), password: $u.user,
+      type: "hysteria2", server: $u.host, server_port: ($u.port // 443),
+      password: ($u.user // $q.auth // $q.password),
       obfs: (if ($q.obfs | nonempty) then { type: $q.obfs, password: ($q["obfs-password"] // "") } else null end),
       tls: { enabled: true, server_name: ($q.sni | nonempty), insecure: (if ($q.insecure | truthy) then true else null end),
              alpn: (($q.alpn | nonempty) | if . then split(",") else null end) } });
@@ -207,53 +210,125 @@ def link2server:
     elif ($l | startswith("trojan://")) then trojan($l | urlparse)
     elif ($l | startswith("vmess://")) then vmess($l)
     elif ($l | startswith("ss://")) then ss($l)
-    elif ($l | startswith("hysteria2://") or startswith("hy2://")) then hy2($l | urlparse)
+    elif ($l | startswith("hysteria2://") or startswith("hy2://") or startswith("hysteria://")) then hy2($l | urlparse)
     else empty end;
 
 def safe(f): try f catch empty;
 
-# ---- Xray-JSON подписка (формат, который отдают Happ/Remnawave по User-Agent Happ) ----
-def xray2server($remarks):
-  (.outbounds // [])
-  | map(select(.protocol == "vless" or .protocol == "vmess" or .protocol == "trojan" or .protocol == "shadowsocks"))
-  | first // empty
-  | . as $o
+def parse_port:
+  if . == null then null
+  elif type == "number" then .
+  elif (type == "string" and isdigits) then tonumber
+  else null end;
+
+# ---- Xray-JSON / sing-box outbound разбор ----
+def outbound2server($remarks):
+  . as $o
+  | (($o.protocol // $o.type // "") | ascii_downcase) as $proto_raw
+  | (if $proto_raw == "hy2" then "hysteria2" elif $proto_raw == "ss" then "shadowsocks" else $proto_raw end) as $proto
+  | select($proto == "vless" or $proto == "vmess" or $proto == "trojan" or $proto == "shadowsocks" or $proto == "hysteria" or $proto == "hysteria2")
   | ($o.streamSettings // {}) as $ss
-  | ($ss.network // "tcp") as $net
-  | ($ss.security // "none") as $sec
+  | ($ss.network // (if $proto == "hysteria2" or $proto == "hysteria" then "udp" else "tcp" end)) as $net
+  | ($ss.security // (if $proto == "hysteria2" or $proto == "hysteria" then "tls" else "none" end)) as $sec
   | ($ss.realitySettings // $ss.tlsSettings // {}) as $ts
-  | { sni: $ts.serverName, fp: $ts.fingerprint, pbk: $ts.publicKey, sid: $ts.shortId,
-      alpn: (($ts.alpn // []) | join(",")), allowInsecure: ($ts.allowInsecure | if . == true then "1" else null end),
-      host: ($ss.wsSettings.headers.Host // $ss.httpupgradeSettings.host // null) } as $q
-  | ($ss.wsSettings.path // $ss.httpupgradeSettings.path // $ss.httpSettings.path // null) as $path
-  | ($ss.grpcSettings.serviceName // null) as $svc
-  | transport($net; ($q.host | nonempty); ($path | nonempty); ($svc | nonempty); null) as $tr
-  | ($o.settings.vnext[0] // $o.settings.servers[0] // $o.settings) as $v
-  | ($v.users[0] // $v) as $usr
-  | ($v.address // $o.settings.address) as $addr
-  | ($v.port // $o.settings.port) as $port
-  | if $o.protocol == "vless" then
-      mk("vless"; $remarks; $addr; $port; $net; $sec; {
-        type: "vless", server: $addr, server_port: $port, uuid: $usr.id,
-        flow: ($usr.flow | nonempty), packet_encoding: "xudp",
-        tls: tlsobj($sec; $q; $net), transport: $tr })
-    elif $o.protocol == "vmess" then
-      mk("vmess"; $remarks; $addr; $port; $net; $sec; {
-        type: "vmess", server: $addr, server_port: $port, uuid: $usr.id, security: ($usr.security // "auto"),
-        tls: tlsobj($sec; $q; $net), transport: $tr })
-    elif $o.protocol == "trojan" then
-      mk("trojan"; $remarks; $addr; $port; $net; $sec; {
-        type: "trojan", server: $addr, server_port: $port, password: $usr.password,
-        tls: tlsobj($sec; $q; $net), transport: $tr })
-    else
-      mk("ss"; $remarks; $addr; $port; "tcp"; "none"; {
-        type: "shadowsocks", server: $addr, server_port: $port, method: $usr.method, password: $usr.password })
-    end;
+  | { sni: ($ts.serverName // $o.tls.server_name // $o.tls.serverName),
+      fp: ($ts.fingerprint // $o.tls.utls.fingerprint),
+      pbk: ($ts.publicKey // $o.tls.reality.public_key),
+      sid: ($ts.shortId // $o.tls.reality.short_id),
+      alpn: (($ts.alpn // $o.tls.alpn // []) | if type == "array" then join(",") else . end),
+      allowInsecure: (if ($ts.allowInsecure | truthy) or ($o.tls.insecure | truthy) then "1" else null end),
+      host: ($ss.wsSettings.headers.Host // $ss.httpupgradeSettings.host // $o.transport.headers.Host // null) } as $q
+  | ($ss.wsSettings.path // $ss.httpupgradeSettings.path // $ss.httpSettings.path // $o.transport.path // null) as $path
+  | ($ss.grpcSettings.serviceName // $o.transport.service_name // null) as $svc
+  | (if $o.transport != null then $o.transport else transport($net; ($q.host | nonempty); ($path | nonempty); ($svc | nonempty); null) end) as $tr
+  | ($o.settings.vnext[0] // $o.settings.servers[0] // $o.settings // {}) as $v
+  | ($v.users[0] // $v // {}) as $usr
+  | ($v.address // $o.settings.address // $o.server // "") as $addr
+  | (($v.port // $o.settings.port // $o.server_port) | parse_port) as $port
+  | ($remarks | nonempty
+     // (if ($o.tag != null and $o.tag != "" and $o.tag != "proxy" and $o.tag != "default" and $o.tag != "DIRECT" and $o.tag != "direct" and $o.tag != "block") then $o.tag else null end)
+     // ($o.remarks | nonempty)
+     // ($o.ps | nonempty)
+     // ($o.tag | nonempty)
+     // "") as $name
+  | if $proto == "vless" then
+      mk("vless"; $name; $addr; $port; $net; $sec; {
+        type: "vless", server: $addr, server_port: $port, uuid: ($usr.id // $o.uuid),
+        flow: (($usr.flow // $o.flow) | nonempty), packet_encoding: "xudp",
+        tls: (if $o.tls != null then $o.tls else tlsobj($sec; $q; $net) end), transport: $tr })
+    elif $proto == "vmess" then
+      mk("vmess"; $name; $addr; $port; $net; $sec; {
+        type: "vmess", server: $addr, server_port: $port, uuid: ($usr.id // $o.uuid),
+        security: ($usr.security // $o.security // "auto"),
+        alter_id: ((($usr.alterId // $o.alter_id // 0) | parse_port) // 0),
+        tls: (if $o.tls != null then $o.tls else tlsobj($sec; $q; $net) end), transport: $tr })
+    elif $proto == "trojan" then
+      mk("trojan"; $name; $addr; $port; $net; $sec; {
+        type: "trojan", server: $addr, server_port: $port, password: ($usr.password // $o.password),
+        tls: (if $o.tls != null then $o.tls else tlsobj($sec; $q; $net) end), transport: $tr })
+    elif $proto == "shadowsocks" then
+      mk("ss"; $name; $addr; $port; "tcp"; "none"; {
+        type: "shadowsocks", server: $addr, server_port: $port,
+        method: ($usr.method // $o.settings.method // $o.method),
+        password: ($usr.password // $o.settings.password // $o.password) })
+    elif $proto == "hysteria2" or $proto == "hysteria" then
+      ($ss.hysteriaSettings.version // $ss.hysteria2Settings.version // $o.settings.version // $o.version) as $ver_raw
+      | (if ($ver_raw == 1 or $ver_raw == "1") then "hysteria" else "hysteria2" end) as $hy_ver
+      | ($usr.password // $usr.auth // $o.settings.password // $o.settings.auth // $ss.hysteriaSettings.auth // $ss.hysteriaSettings.password // $ss.hysteria2Settings.password // $ss.hysteria2Settings.auth // $o.password // $o.auth // $o.auth_str // "") as $pass
+      | (if $o.obfs != null then $o.obfs
+         elif ($o.settings.obfs | type) == "object" then $o.settings.obfs
+         elif ($ss.hysteriaSettings.obfs | type) == "object" then $ss.hysteriaSettings.obfs
+         elif ($ss.hysteria2Settings.obfs | type) == "object" then $ss.hysteria2Settings.obfs
+         elif (($o.settings.obfs | type) == "string") and ($o.settings.obfs != "") then { type: "salamander", password: $o.settings.obfs }
+         elif (($ss.hysteriaSettings.obfs | type) == "string") and ($ss.hysteriaSettings.obfs != "") then { type: "salamander", password: $ss.hysteriaSettings.obfs }
+         elif (($ss.hysteria2Settings.obfs | type) == "string") and ($ss.hysteria2Settings.obfs != "") then { type: "salamander", password: $ss.hysteria2Settings.obfs }
+         elif ($o.settings.obfsPassword | nonempty) then { type: "salamander", password: $o.settings.obfsPassword }
+         elif ($ss.hysteriaSettings.obfsPassword | nonempty) then { type: "salamander", password: $ss.hysteriaSettings.obfsPassword }
+         elif ($o.obfs_password | nonempty) then { type: "salamander", password: $o.obfs_password }
+         else null end) as $obfs_obj
+      | (if $o.tls != null then $o.tls
+         else { enabled: true,
+                server_name: ($q.sni | nonempty // $addr),
+                insecure: (if ($q.allowInsecure | truthy) then true else null end),
+                alpn: (if $q.alpn then ($q.alpn | split(",")) else ["h3"] end) } end) as $tls_obj
+      | if $hy_ver == "hysteria" then
+          mk("hysteria"; $name; $addr; ($port // 443); "udp"; "tls"; {
+            type: "hysteria", server: $addr, server_port: ($port // 443),
+            auth_str: $pass, obfs: $obfs_obj, tls: $tls_obj })
+        else
+          mk("hysteria2"; $name; $addr; ($port // 443); "udp"; "tls"; {
+            type: "hysteria2", server: $addr, server_port: ($port // 443),
+            password: $pass, obfs: $obfs_obj, tls: $tls_obj,
+            up_mbps: ($o.settings.up_mbps // $o.up_mbps // null),
+            down_mbps: ($o.settings.down_mbps // $o.down_mbps // null) })
+        end
+    else empty end;
+
+# Обратная совместимость
+def xray2server($remarks): outbound2server($remarks);
+
+def is_proxy_proto:
+  . as $p
+  | ($p == "vless" or $p == "vmess" or $p == "trojan" or $p == "shadowsocks" or $p == "ss" or $p == "hysteria" or $p == "hysteria2" or $p == "hy2");
 
 def json2servers:
   (if type == "array" then .[] else . end)
   | . as $cfg
-  | safe($cfg | xray2server($cfg.remarks // $cfg.ps // ""));
+  | if type == "object" and ($cfg | (has("remarks") or has("ps"))) and ($cfg | has("outbounds")) then
+      ($cfg.remarks // $cfg.ps) as $remarks
+      | (($cfg.outbounds // [])
+         | map(select(((.protocol // .type // "") | ascii_downcase) as $pr | ($pr | is_proxy_proto)))
+         | first // empty)
+      | safe(outbound2server($remarks))
+    elif ($cfg | has("outbounds")) and ($cfg.outbounds | type == "array") then
+      $cfg.outbounds[]
+      | select(((.protocol // .type // "") | ascii_downcase) as $pr | ($pr | is_proxy_proto))
+      | safe(outbound2server(""))
+    elif ($cfg | has("protocol")) or ($cfg | has("type")) then
+      safe($cfg | outbound2server($cfg.remarks // $cfg.ps // ""))
+    else
+      empty
+    end;
 
 def emit: [((.outbound // del(.name)) | tojson), tojson] | join("\t");
 
