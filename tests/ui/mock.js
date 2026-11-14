@@ -35,7 +35,8 @@ module.exports = function (scenario) {
     logs: function () { return { log: '== sing-box ==\\n+0300 2026-10-09 21:40:01 INFO inbound/tun[tun-in]: started at vless0\\n+0300 2026-10-09 21:40:09 WARN outbound/vless[s-a0000002]: connection timeout\\n+0300 2026-10-09 21:40:12 ERROR dns: exchange failed\\n\\n== system ==\\nOct  9 21:40:00 router vless: net-up ok\\n' }; },
     clear: function () { return { ok: true }; }, clearlog: function () { return { ok: true }; },
     'discord-status': function () { return { mode: 'auto', installed: true, running: true, active: 'zapret', strategy: 's3', strategy_name: 'fake + fakedsplit, fooling ts', zapret: 'v72', flowseal: 'v1.10.3', since: 1, last_check: 1, now: 100, reason: '', fails: 0, results: [], conflict: false, vpn_servers: 3, busy: '' }; },
-    'discord-run': function () { return { ok: true, started: true }; }
+    'discord-run': function () { return { ok: true, started: true }; },
+    'test-route': function (target) { return { ok: true, route: 'ai-proxy', label: 'Выделенный сервер для ИИ', rule: 'Пресет: ИИ и нейросети (отдельный сервер)', target: target || 'claude.ai', server: { id: 'a0000000', name: '🇩🇪 Мост — Германия', host: 'h0.example.com', port: 443, proto: 'vless', sec: 'reality' }, ping: 62, vpn_running: true }; }
   };
   })();`;
 };

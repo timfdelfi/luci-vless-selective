@@ -255,6 +255,8 @@ var CSS = [
 '.hv-chip:hover{border-color:var(--ac)}',
 '.hv-chip.on{background:var(--acs);border-color:var(--ac);color:var(--ac)}',
 '.hv[data-theme=dark] .hv-chip.on{color:#7fb4e8}',
+'.hv-qchip{display:inline-flex;align-items:center;padding:3px 8px;border:1px solid var(--line);background:var(--card);border-radius:var(--r);font-size:11.5px;font-weight:550;cursor:pointer;transition:.1s;color:var(--tx)}',
+'.hv-qchip:hover{border-color:var(--ac);background:var(--acs);filter:none}',
 '.hv-label{font-size:13.5px;font-weight:600;margin:12px 0 5px}',
 '.hv-label span{display:block;font-size:12px;font-weight:400;color:var(--tx2);margin-top:1px}',
 '.hv-hwid{display:flex;gap:6px;align-items:center}',
@@ -1673,8 +1675,7 @@ return view.extend({
 		];
 		quickSamples.forEach(function (pair) {
 			var chip = E('button', {
-				type: 'button', 'class': 'hv-chip',
-				style: 'cursor:pointer;font-size:11.5px;padding:3px 8px;',
+				type: 'button', 'class': 'hv-qchip',
 				click: function () {
 					routeTargetInput.value = pair[1];
 					routeTestBtn.click();
