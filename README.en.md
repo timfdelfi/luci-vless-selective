@@ -26,6 +26,8 @@ It runs [sing-box](https://github.com/SagerNet/sing-box) in TUN mode and routes 
 - **Official sing-box core download.** Automatically detects router CPU architecture (`mipsle`, `aarch64`, `arm`, `x86_64`, etc.) and downloads the official sing-box binary if not available in opkg or outdated (`vless fetch-core`).
 - **Formats.** `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, and subscriptions over `https://…` (plain, base64, Xray JSON). Reality, TLS, WebSocket, gRPC, HTTPUpgrade, h2.
 - **Routing presets.** Everything, "everything except Russian sites", or "selected services only": Telegram, YouTube, Discord, Meta, X, AI services, 18+ — plus your own sites.
+- **Dedicated AI routing.** Route AI services (ChatGPT, Claude, Gemini, Antigravity, etc.) through a specific country or server independently from your main VPN.
+- **Route inspection tool.** In-app route test tool to verify whether any domain or IP routes directly, through the main VPN, or through the AI proxy, with live latency measurement.
 - **Subscription info.** Remaining traffic and expiry date, automatic subscription refresh.
 - **Advanced.** Per-device selection, custom exclusions, Kill Switch, DNS through the VPN, IPv6 and QUIC blocking, MTU, TUN stack.
 - **Ping.** "Ping all", per-server ping, and a direct (no-VPN) TCP-connect ping that works even while disconnected.
